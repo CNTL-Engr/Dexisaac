@@ -18,7 +18,7 @@ class Scene:
         """
         self.num_envs = num_envs
         self.env_spacing = env_spacing
-        self.usd_path = "/home/wyq/xc/equi/mesh/env.usd"
+        self.usd_path = "/home/disk_18T/user/kjy/equi/mesh/env.usd"
         
         # 记录关键路径
         self.env_paths = {
@@ -698,8 +698,8 @@ class Scene:
 
         
         # Meshdata 数据集路径
-        ycb_root = "/home/wyq/xc/equi/IsaacLab/scripts/workspace/meshdata"
-        ycb_target_root = "/home/wyq/xc/equi/IsaacLab/scripts/workspace/meshdata_target"
+        ycb_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/meshdata"
+        ycb_target_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/meshdata_target"
         
         # 查找所有包含 textured.usd 的模型
         get_models = lambda root: [d for d in os.listdir(root) if os.path.exists(os.path.join(root, d, "textured.usd"))] if os.path.exists(root) else []

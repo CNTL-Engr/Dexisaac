@@ -37,7 +37,7 @@ def test_sam2_multipoint():
     rgb_img, depth_img = state.get_img()
     
     # Save full RGB for debug
-    output_dir = "/home/wyq/xc/equi/IsaacLab/scripts/workspace/test_imgs_multipoint"
+    output_dir = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/test_imgs_multipoint"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         

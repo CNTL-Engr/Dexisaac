@@ -6,7 +6,7 @@ import sys
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
 
 class SAMWrapper:
-    def __init__(self, checkpoint_path="/home/wyq/xc/equi/IsaacLab/scripts/workspace/sam_model/sam_vit_h_4b8939.pth", model_type="vit_h", device="cuda"):
+    def __init__(self, checkpoint_path="/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/sam_model/sam_vit_h_4b8939.pth", model_type="vit_h", device="cuda"):
         self.device = device
         self.sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
         self.sam.to(device=self.device)
@@ -84,7 +84,7 @@ def show_anns(anns):
 
 if __name__ == "__main__":
     # Load image
-    image = cv2.imread('/home/wyq/xc/equi/IsaacLab/scripts/workspace/src/image.png')
+    image = cv2.imread('/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/src/image.png')
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
     # Initialize Wrapper (defaults)

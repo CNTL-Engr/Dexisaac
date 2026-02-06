@@ -1,5 +1,5 @@
 import sys
-sys.path.insert(0, "/home/wyq/xc/equi/IsaacLab/scripts/workspace/src")
+sys.path.insert(0, "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/src")
 from scene import Scene
 import torch
 

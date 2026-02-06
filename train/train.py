@@ -29,8 +29,8 @@ def parse_args():
     
     # 环境参数
     parser.add_argument('--num_envs', default=1, type=int, help='并行环境数量')
-    parser.add_argument('--num_objects_min', default=8, type=int, help='最小物体数')
-    parser.add_argument('--num_objects_max', default=8, type=int, help='最大物体数')
+    parser.add_argument('--num_objects_min', default=9, type=int, help='最小物体数')
+    parser.add_argument('--num_objects_max', default=9, type=int, help='最大物体数')
     parser.add_argument('--episode_max_steps', default=8, type=int, help='每个 episode 最大步数')
     parser.add_argument('--headless', action='store_true', default=True, help='无界面模式 (默认开启)')
     parser.add_argument('--no-headless', dest='headless',default=False, action='store_false', help='启用可视化界面')
@@ -49,12 +49,12 @@ def parse_args():
     
     # 保存参数
     parser.add_argument('--save_every', default=50, type=int, help='保存频率(episodes)')
-    parser.add_argument('--checkpoint_base_dir', default='/home/wyq/xc/equi/IsaacLab/scripts/workspace/train/results', type=str, help='检查点根目录（将自动生成子目录名）')
+    parser.add_argument('--checkpoint_base_dir', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results', type=str, help='检查点根目录（将自动生成子目录名）')
     parser.add_argument('--save_intermediate', action='store_true', default=True, help='是否保存中间模型（默认关闭，只保存最终模型）')
     
     # 模型加载参数
     parser.add_argument('--load_model', action='store_true', default=True, help='是否加载预训练模型')
-    parser.add_argument('--model_path', default='/home/wyq/xc/equi/IsaacLab/scripts/workspace/train/results/equi_obj_7/model_final.pth', type=str, help='预训练模型路径')
+    parser.add_argument('--model_path', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_7/model_final.pth', type=str, help='预训练模型路径')
     parser.add_argument('--use_equivariant', action='store_true', default=True, help='是否使用C4等变网络（默认开启）')
     parser.add_argument('--device', type=str, default='cuda', help='设备: cuda 或 cpu')
     parser.add_argument('--seed', default=42, type=int, help='随机种子')
@@ -178,6 +178,11 @@ def main():
         episode_retry_count = 0
         max_episode_retries = 5  # 最大重试次数
         episode_valid = False
+        # 初始化变量，确保在 while/for 循环后始终有绑定值
+        step = 0
+        episode_reward = 0.0
+        env_rewards = [0.0] * args.num_envs
+        infos: list = []
         
         while not episode_valid and episode_retry_count < max_episode_retries:
             episode_retry_count += 1
@@ -413,15 +418,11 @@ def main():
                     is_success = infos[env_idx].get('success', False)
                     recent_100_env_results.append(is_success)
         
-        # [显存优化] Episode结束后清理显存
-        if 'states' in dir():
-            del states
-        if 'rewards' in dir():
-            del rewards  
-        if 'dones' in dir():
-            del dones
-        if 'infos' in dir():
-            del infos
+        # [显存优化] Episode结束后清理显存，释放tensor引用
+        states = None  # type: ignore[assignment]
+        rewards = None  # type: ignore[assignment]
+        dones = None  # type: ignore[assignment]
+        infos = None  # type: ignore[assignment]
         torch.cuda.empty_cache()
         gc.collect()  # [内存优化] 强制Python垃圾回收
                 

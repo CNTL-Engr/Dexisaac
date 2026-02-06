@@ -129,8 +129,8 @@ def design_scene() -> dict:
     # Create a dictionary for the scene entities
     scene_entities = {}
     # Meshdata paths
-    mesh_root = "/home/wyq/xc/equi/IsaacLab/scripts/workspace/meshdata"
-    mesh_target_root = "/home/wyq/xc/equi/IsaacLab/scripts/workspace/meshdata_target"
+    mesh_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/meshdata"
+    mesh_target_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/meshdata_target"
     
     # Get available models
     def get_models(root):

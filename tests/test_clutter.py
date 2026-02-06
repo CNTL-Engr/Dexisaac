@@ -32,7 +32,7 @@ def main():
         # Capture and save images at frame 50
         if frame_count == 50:
             rgb, depth, seg = scene.state.get_img(hide_robot=True)  # This calls camera.update() internally!
-            scene.state.save_img(rgb, depth, seg, "/home/wyq/xc/equi/IsaacLab/scripts/workspace/test_imgs")
+            scene.state.save_img(rgb, depth, seg, "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/test_imgs")
             captured = True  # Skip the update below
             
         frame_count += 1

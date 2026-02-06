@@ -10,7 +10,7 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 class SAM2Wrapper:
     def __init__(self, 
-                 checkpoint_path="/home/wyq/xc/equi/IsaacLab/scripts/workspace/sam_model/sam2.1_hiera_large.pt", 
+                 checkpoint_path="/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/sam_model/sam2.1_hiera_large.pt", 
                  config_file="configs/sam2.1/sam2.1_hiera_l.yaml",
                  device="cuda"):
         self.device = device

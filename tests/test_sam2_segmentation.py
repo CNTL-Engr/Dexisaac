@@ -37,7 +37,7 @@ def test_sam2_segmentation():
     rgb_img, _ = state.get_img()
     
     # Save full RGB for debug
-    output_dir = "/home/wyq/xc/equi/IsaacLab/scripts/workspace/test_imgs"
+    output_dir = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/test_imgs"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         

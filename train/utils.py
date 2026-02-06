@@ -140,7 +140,7 @@ def print_training_log(mode, **kwargs):
                 # 空推
                 is_empty = env_info.get('empty_push', False)
                 emp = env_info.get('empty_metrics', {})
-                print(f"  空推判定: {'⚠ 空推' if is_empty else '✓ 有效'} (变化: {int(emp.get('change_value',0))}/{emp.get('total_pixels',1)} ({emp.get('change_ratio',0.0):.2f}%))")
+                print(f"  推动判定: {'⚠ 空推' if is_empty else '✓ 有效'} (变化: {int(emp.get('change_value',0))}/{emp.get('total_pixels',1)} ({emp.get('change_ratio',0.0):.2f}%))")
                 
                 print("-" * 8)
                 

@@ -1,2 +1,3 @@
-cd /home/wyq/xc/equi/IsaacLab/scripts/workspace/train
-python train.py  --no-headless
+cd /home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/train
+export CUDA_VISIBLE_DEVICES=3
+python train.py  #--no-headless

@@ -1,5 +1,5 @@
 import sys
-sys.path.insert(0, "/home/wyq/xc/equi/IsaacLab/scripts/workspace/src")
+sys.path.insert(0, "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/src")
 from scene import Scene
 
 # === 创建场景 ===
@@ -27,7 +27,7 @@ state = scene.states[0]
 rgb, depth, seg = state.get_img()
 
 # 保存原始图像
-save_path = "/home/wyq/xc/equi/IsaacLab/scripts/workspace/test_imgs/mask_test"
+save_path = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/test_imgs/mask_test"
 state.save_img(rgb, depth, seg, save_path)
 
 # 提取物体掩膜

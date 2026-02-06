@@ -57,7 +57,7 @@ def test_out_of_bounds_detection():
             print(f"  - 非零像素数: {np.sum(raw_mask > 0)}")
             
             # 保存掩膜图像
-            save_path = f"/home/wyq/xc/equi/IsaacLab/scripts/workspace/test_imgs/raw_mask_env_{env_idx}.png"
+            save_path = f"/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/test_imgs/raw_mask_env_{env_idx}.png"
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             cv2.imwrite(save_path, raw_mask)
             print(f"  ✓ 原始掩膜已保存: {save_path}")
@@ -93,7 +93,7 @@ def test_out_of_bounds_detection():
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             
             # 保存可视化
-            vis_path = f"/home/wyq/xc/equi/IsaacLab/scripts/workspace/test_imgs/vis_mask_env_{env_idx}.png"
+            vis_path = f"/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/test_imgs/vis_mask_env_{env_idx}.png"
             cv2.imwrite(vis_path, vis_img)
             print(f"  ✓ 可视化已保存: {vis_path}")
     

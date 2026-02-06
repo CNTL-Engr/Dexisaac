@@ -1,0 +1,8 @@
+{
+    "extraPaths": [
+        "src",
+        "train"
+    ],
+    "reportMissingImports": false,
+    "reportArgumentType": false
+}

@@ -29,7 +29,7 @@ def main():
         if i == 10:
             print("Capturing image...")
             imgs= scene.state.camera.get_images(hide_robot=True)
-            scene.state.camera.save_images(imgs,"/home/wyq/xc/equi/IsaacLab/scripts/workspace/test_imgs")
+            scene.state.camera.save_images(imgs,"/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/test_imgs")
             break
     # print("Test complete.")
     scene.simulation_app.close()

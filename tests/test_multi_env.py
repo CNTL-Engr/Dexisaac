@@ -1,6 +1,6 @@
 
 import sys
-sys.path.insert(0, "/home/wyq/xc/equi/IsaacLab/scripts/workspace/src")
+sys.path.insert(0, "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/src")
 from scene import Scene
 # === 创建2个场景 ==
 # print("[TEST] Creating 2 environments...")
@@ -32,7 +32,7 @@ def main():
             for env_idx, state in enumerate(scene.states):
                 print(f" Environment {env_idx}...")
                 rgb, depth, seg = state.get_img()
-                save_path = f"/home/wyq/xc/equi/IsaacLab/scripts/workspace/test_imgs/Scene_{env_idx}"
+                save_path = f"/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/test_imgs/Scene_{env_idx}"
                 state.save_img(rgb, depth, seg, save_path)
                 
                 # 1. 提取并保存目标物体掩膜
@@ -52,7 +52,7 @@ def main():
                 if raw_global_mask is not None:
                     import cv2
                     import os
-                    save_path = f"/home/wyq/xc/equi/IsaacLab/scripts/workspace/test_imgs/Scene_{env_idx}"
+                    save_path = f"/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/test_imgs/Scene_{env_idx}"
                     os.makedirs(save_path, exist_ok=True)
                     raw_mask_path = f"{save_path}/raw_global_mask.png"
                     cv2.imwrite(raw_mask_path, raw_global_mask)
