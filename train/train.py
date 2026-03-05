@@ -36,15 +36,15 @@ def parse_args():
     parser.add_argument('--no-headless', dest='headless',default=False, action='store_false', help='启用可视化界面')
     
     # 训练参数
-    parser.add_argument('--n_episodes', default=500, type=int, help='总训练轮数')
-    parser.add_argument('--batch_size', default=16, type=int, help='训练批大小（降至16以节省显存）')
+    parser.add_argument('--n_episodes', default=888, type=int, help='总训练轮数')
+    parser.add_argument('--batch_size', default=16, type=int, help='训练批大小')
     parser.add_argument('--learning_rate', default=1e-4, type=float, help='学习率')
     parser.add_argument('--gamma', default=0.99, type=float, help='折扣因子')
     parser.add_argument('--epsilon_start', default=0.7, type=float, help='初始探索率')
     parser.add_argument('--epsilon_end', default=0.05, type=float, help='最终探索率')
-    parser.add_argument('--epsilon_decay_steps', default=2500, type=int, help='探索衰减步数')
+    parser.add_argument('--epsilon_decay_steps', default=2800, type=int, help='探索衰减步数')
     parser.add_argument('--target_update_freq', default=10, type=int, help='目标网络更新频率(步数)')
-    parser.add_argument('--replay_buffer_size', default=10000, type=int, help='经验池大小')
+    parser.add_argument('--replay_buffer_size', default=12000, type=int, help='经验池大小')
     parser.add_argument('--min_buffer_size', default=16, type=int, help='开始训练的最小经验数')
     
     # 保存参数

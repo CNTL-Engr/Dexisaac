@@ -449,7 +449,7 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, log_filename)
 
-    with open(log_path, 'w', newline='') as f:
+    with open(log_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
 
         # ---- 元信息 ----
@@ -496,5 +496,4 @@ if __name__ == "__main__":
 # python eval/eval.py --model_path /path/to/model.pth --n_episodes 100 --seed 42
 
 # # 自定义参数
-# python eval/eval.py --model_path model_results/equi_obj_9/model_final.pth \
-#     --n_episodes 50 --seed 123 --episode_max_steps 10 --num_objects_min 7 --num_objects_max 9
+# python eval.py --model_path /home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_9/model_1000_9s.pth --n_episodes 50 --seed 123 --episode_max_steps 10 --num_objects_min 7 --num_objects_max 9
