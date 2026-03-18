@@ -36,21 +36,21 @@ def parse_args():
 
     # 模型参数
     parser.add_argument('--model_path', type=str,
-                        default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_7/model_final.pth',
+                        default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_9/model_final.pth',
                         help='训练好的模型文件路径')
     parser.add_argument('--use_equivariant', action='store_true', default=True,
                         help='是否使用C4等变网络（默认开启）')
 
     # 评估参数
-    parser.add_argument('--n_episodes', default=100, type=int, help='评估轮数')
+    parser.add_argument('--n_episodes', default=200, type=int, help='评估轮数')
     parser.add_argument('--seed', default=None, type=int,
                         help='随机种子（不指定则自动随机生成）')
     parser.add_argument('--episode_max_steps', default=8, type=int,
                         help='每个 episode 最大步数')
 
     # 环境参数
-    parser.add_argument('--num_objects_min', default=9, type=int, help='最小物体数')
-    parser.add_argument('--num_objects_max', default=9, type=int, help='最大物体数')
+    parser.add_argument('--num_objects_min', default=7, type=int, help='最小物体数')
+    parser.add_argument('--num_objects_max', default=7, type=int, help='最大物体数')
     parser.add_argument('--num_envs', default=1, type=int, help='并行环境数量')
     parser.add_argument('--headless', action='store_true', default=True,
                         help='无界面模式 (默认开启)')
@@ -240,6 +240,7 @@ def main():
 
             # 重置环境（随机生成场景，随机布置所有物体的位置和旋转角度）
             states, spawned_objects = env.reset()
+            print(f"  物体数量: {len(spawned_objects)}")
             torch.cuda.empty_cache()
 
             # 重置 episode 状态
@@ -488,6 +489,10 @@ def main():
     # 关闭仿真
     scene.simulation_app.close()
 
+    # 强制退出进程：Isaac Sim 的后台线程可能阻止进程正常退出，
+    # 导致 batch_eval.sh 无法继续执行下一次评估
+    os._exit(0)
+
 
 if __name__ == "__main__":
     main()
@@ -496,4 +501,4 @@ if __name__ == "__main__":
 # python eval/eval.py --model_path /path/to/model.pth --n_episodes 100 --seed 42
 
 # # 自定义参数
-# python eval.py --model_path /home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_9/model_1000_9s.pth --n_episodes 50 --seed 123 --episode_max_steps 10 --num_objects_min 7 --num_objects_max 9
+# python eval.py --model_path /home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_9/model_final.pth --n_episodes 200 --seed 123 --episode_max_steps 8 --num_objects_min 7 --num_objects_max 9

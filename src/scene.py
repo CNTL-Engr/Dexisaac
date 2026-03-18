@@ -698,7 +698,7 @@ class Scene:
 
         
         # Meshdata 数据集路径
-        ycb_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/meshdata"
+        ycb_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/meshdata_CH"
         ycb_target_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/meshdata_target"
         
         # 查找所有包含 textured.usd 的模型

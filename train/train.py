@@ -29,8 +29,8 @@ def parse_args():
     
     # 环境参数
     parser.add_argument('--num_envs', default=1, type=int, help='并行环境数量')
-    parser.add_argument('--num_objects_min', default=9, type=int, help='最小物体数')
-    parser.add_argument('--num_objects_max', default=9, type=int, help='最大物体数')
+    parser.add_argument('--num_objects_min', default=5, type=int, help='最小物体数')
+    parser.add_argument('--num_objects_max', default=5, type=int, help='最大物体数')
     parser.add_argument('--episode_max_steps', default=8, type=int, help='每个 episode 最大步数')
     parser.add_argument('--headless', action='store_true', default=True, help='无界面模式 (默认开启)')
     parser.add_argument('--no-headless', dest='headless',default=False, action='store_false', help='启用可视化界面')
@@ -40,9 +40,9 @@ def parse_args():
     parser.add_argument('--batch_size', default=16, type=int, help='训练批大小')
     parser.add_argument('--learning_rate', default=1e-4, type=float, help='学习率')
     parser.add_argument('--gamma', default=0.99, type=float, help='折扣因子')
-    parser.add_argument('--epsilon_start', default=0.7, type=float, help='初始探索率')
+    parser.add_argument('--epsilon_start', default=0.8, type=float, help='初始探索率')
     parser.add_argument('--epsilon_end', default=0.05, type=float, help='最终探索率')
-    parser.add_argument('--epsilon_decay_steps', default=2800, type=int, help='探索衰减步数')
+    parser.add_argument('--epsilon_decay_steps', default=3500, type=int, help='探索衰减步数')
     parser.add_argument('--target_update_freq', default=10, type=int, help='目标网络更新频率(步数)')
     parser.add_argument('--replay_buffer_size', default=12000, type=int, help='经验池大小')
     parser.add_argument('--min_buffer_size', default=16, type=int, help='开始训练的最小经验数')
@@ -54,7 +54,7 @@ def parse_args():
     
     # 模型加载参数
     parser.add_argument('--load_model', action='store_true', default=True, help='是否加载预训练模型')
-    parser.add_argument('--model_path', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_7/model_final.pth', type=str, help='预训练模型路径')
+    parser.add_argument('--model_path', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_4/model_final.pth', type=str, help='预训练模型路径')
     parser.add_argument('--use_equivariant', action='store_true', default=True, help='是否使用C4等变网络（默认开启）')
     parser.add_argument('--device', type=str, default='cuda', help='设备: cuda 或 cpu')
     parser.add_argument('--seed', default=42, type=int, help='随机种子')

@@ -68,7 +68,9 @@ class PushEnv:
             self.scene._delete_objects(self.spawned_objects, env_ids_to_delete=None)  # 删除所有环境的物体
             self.spawned_objects = None
         
-        # 重置 scene
+        # 重置 scene（清除缓存配置，确保每轮重新随机生成物体数量和布局）
+        if hasattr(self.scene, '_global_spawn_config'):
+            del self.scene._global_spawn_config
         spawned_objects = self.scene.create_clutter_environment(
             num_objects_range=(self.num_objects_min,self.num_objects_max)   
         )
@@ -347,10 +349,21 @@ class PushEnv:
         # 2. 同步执行循环
         dt = 0.01  # Simulation dt
         all_finished = False
+        max_iterations = 500  # 全局安全上限：500次循环 ≈ 5秒仿真时间
+        iteration_count = 0
         
         from isaaclab.utils.math import quat_slerp
         
         while not all_finished and self.scene.is_app_running():
+            iteration_count += 1
+            if iteration_count > max_iterations:
+                print(f"⚠ [_execute_push_batch] 超过最大循环次数 {max_iterations}，强制退出")
+                for env_idx in active_envs:
+                    if not env_plans[env_idx]['done']:
+                        env_plans[env_idx]['done'] = True
+                        print(f"  ⚠ Env {env_idx} 未完成，强制标记为完成")
+                break
+
             all_finished = True
             
             # A. 为每个Robot设置命令

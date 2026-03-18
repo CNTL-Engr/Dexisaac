@@ -25,6 +25,7 @@ sam_model/
 meshdata/
 meshdata_target/
 object/
+meshdata_CH/
 # 忽略原始模型数据文件
 meshdata*/
 *imgs*/
