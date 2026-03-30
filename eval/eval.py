@@ -437,16 +437,33 @@ def main():
 
     # ============================================================
     # 保存 CSV 日志
-    # 命名规则: <模型文件名>_seed<种子>_<开始时间>.csv
+    # 命名规则: 场景中的物体个数+随机种子+评估日期时间
+    # 存放路径: 以本次评估使用的模型在训练时使用的物体数量命名的文件夹
     # ============================================================
-    model_filename = Path(args.model_path).stem
-    log_filename = f"{model_filename}_seed{args.seed}_{start_time_str}.csv"
+    
+    # 提取评估时场景中的物体个数
+    if args.num_objects_min == args.num_objects_max:
+        scene_obj_str = str(args.num_objects_max)
+    else:
+        scene_obj_str = f"{args.num_objects_min}-{args.num_objects_max}"
+        
+    log_filename = f"{scene_obj_str}_{args.seed}_{start_time_str}.csv"
+
+    # 提取训练时使用的物体数量作为文件夹名
+    model_dir_name = Path(args.model_path).parent.name
+    import re
+    match = re.search(r'obj_(\d+(?:_\d+)?)', model_dir_name)
+    if match:
+        train_obj_num = match.group(1)
+    else:
+        train_obj_num = model_dir_name
 
     if args.log_dir:
-        log_dir = args.log_dir
+        base_log_dir = args.log_dir
     else:
-        log_dir = current_dir  # 默认保存到 eval/ 目录
+        base_log_dir = current_dir  # 默认保存到 eval/ 目录
 
+    log_dir = os.path.join(base_log_dir, train_obj_num)
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, log_filename)
 
@@ -502,3 +519,4 @@ if __name__ == "__main__":
 
 # # 自定义参数
 # python eval.py --model_path /home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_9/model_final.pth --n_episodes 200 --seed 123 --episode_max_steps 8 --num_objects_min 7 --num_objects_max 9
+# python eval.py --model_path /home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_4/model_final.pth --n_episodes 500 --num_objects_min 4 --num_objects_max 4
