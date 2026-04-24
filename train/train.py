@@ -19,7 +19,7 @@ sys.path.insert(0, src_path)
 sys.path.insert(0, train_path)
 
 from scene import Scene
-from agent import DQNAgent
+from maml_dqn import MAMLDQNAgent, QuadrantTaskGenerator
 from env_wrapper import PushEnv
 from utils import print_training_log, compute_epsilon, generate_checkpoint_dir
 
@@ -29,22 +29,22 @@ def parse_args():
     
     # 环境参数
     parser.add_argument('--num_envs', default=1, type=int, help='并行环境数量')
-    parser.add_argument('--num_objects_min', default=9, type=int, help='最小物体数')
-    parser.add_argument('--num_objects_max', default=9, type=int, help='最大物体数')
+    parser.add_argument('--num_objects_min', default=4, type=int, help='最小物体数')
+    parser.add_argument('--num_objects_max', default=4, type=int, help='最大物体数')
     parser.add_argument('--episode_max_steps', default=8, type=int, help='每个 episode 最大步数')
     parser.add_argument('--headless', action='store_true', default=True, help='无界面模式 (默认开启)')
     parser.add_argument('--no-headless', dest='headless',default=False, action='store_false', help='启用可视化界面')
     
     # 训练参数
-    parser.add_argument('--n_episodes', default=888, type=int, help='总训练轮数')
+    parser.add_argument('--n_episodes', default=2000, type=int, help='总训练轮数')
     parser.add_argument('--batch_size', default=16, type=int, help='训练批大小')
     parser.add_argument('--learning_rate', default=1e-4, type=float, help='学习率')
     parser.add_argument('--gamma', default=0.99, type=float, help='折扣因子')
     parser.add_argument('--epsilon_start', default=0.8, type=float, help='初始探索率')
-    parser.add_argument('--epsilon_end', default=0.05, type=float, help='最终探索率')
-    parser.add_argument('--epsilon_decay_steps', default=3500, type=int, help='探索衰减步数')
+    parser.add_argument('--epsilon_end', default=0.08, type=float, help='最终探索率')
+    parser.add_argument('--epsilon_decay_steps', default=9000, type=int, help='探索衰减步数')
     parser.add_argument('--target_update_freq', default=10, type=int, help='目标网络更新频率(步数)')
-    parser.add_argument('--replay_buffer_size', default=12000, type=int, help='经验池大小')
+    parser.add_argument('--replay_buffer_size', default=18000, type=int, help='经验池大小')
     parser.add_argument('--min_buffer_size', default=16, type=int, help='开始训练的最小经验数')
     
     # 保存参数
@@ -54,7 +54,7 @@ def parse_args():
     
     # 模型加载参数
     parser.add_argument('--load_model', action='store_true', default=True, help='是否加载预训练模型')
-    parser.add_argument('--model_path', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_8/model_final.pth', type=str, help='预训练模型路径')
+    parser.add_argument('--model_path', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_4/model_final.pth', type=str, help='预训练模型路径')
     parser.add_argument('--use_equivariant', action='store_true', default=True, help='是否使用C4等变网络（默认开启）')
     parser.add_argument('--device', type=str, default='cuda', help='设备: cuda 或 cpu')
     parser.add_argument('--seed', default=42, type=int, help='随机种子')
@@ -110,15 +110,18 @@ def main():
     env = PushEnv(scene=scene, args=args)
     env.max_steps_per_episode = args.episode_max_steps
     
-    # 3. 创建 DQN Agent (根据参数选择等变或非等变网络)
-    print("[3/4] 创建 DQN Agent...")
-    agent = DQNAgent(
+    # 3. 创建 MAML DQN Agent 和任务生成器
+    print("[3/4] 创建 MAML DQN Agent...")
+    agent = MAMLDQNAgent(
         device=args.device,
         lr=args.learning_rate,
         gamma=args.gamma,
-        buffer_capacity=args.replay_buffer_size,
         use_equivariant=args.use_equivariant
     )
+    
+    task_generator = QuadrantTaskGenerator(radius=0.21)
+    current_task_id = 0
+    task_batch_size = 5  # 5 种子任务 (Q1-Q4 Blocked + Dense Clutter) 为一个 Meta-Iteration
     
     # [模型加载] 如果指定加载预训练模型
     if args.load_model:
@@ -189,18 +192,56 @@ def main():
             ik_failed_this_episode = False  # 标记本episode是否发生IK失败
             episode_experiences = []  # 临时存储本episode的经验
             
+            # [MAML] 决定当前是 Support 还是 Query 阶段
+            is_support = (episode % 2 == 0)
+            if is_support:
+                # 采样新任务 (返回 task_id, 四元组, 任务名称)
+                sampled_task_id, task_tuple, task_name = task_generator.sample_task(
+                    total_obstacles=args.num_objects_max - 1
+                )
+                current_task_id += 1
+                phase_name = "Support"
+                
+                if current_task_id % task_batch_size == 1 or task_batch_size == 1:
+                    meta_iter = (current_task_id - 1) // task_batch_size + 1
+                    print("\n" + "=" * 80)
+                    print(f"[Outer-Loop: Meta-Iteration {meta_iter}] 开始收集 {task_batch_size} 个子任务 (Tasks)")
+                    print("=" * 80)
+            else:
+                phase_name = "Query"
+                
+            # [MAML] 生成任务布局
+            target_pos = [0.75, 0.0, 0.06]
+            robot_pos = [0.0, 0.0, 0.0]  # 假设基座原点
+            obstacle_positions = task_generator.generate_positions_for_task(target_pos, robot_pos, task_tuple)
+            force_task_config = {
+                'target_pos': target_pos,
+                'obstacle_positions': obstacle_positions
+            }
+            
             # Episode 开始标题
             if episode_retry_count == 1:
-                print("\n" + "=" * 80)
-                print(f"  Episode {episode+1}/{args.n_episodes}")
-                print("=" * 80)
+                print("\n" + "-" * 60)
+                sub_task_idx = ((current_task_id - 1) % task_batch_size) + 1
+                print(f"  [Sub-Task {sub_task_idx}/{task_batch_size}] Task ID: {current_task_id} ({task_name}), Layout: {task_tuple}")
+                print(f"  [{'Inner-Loop: Support Set' if is_support else 'Outer-Loop: Query Set'}] 收集数据 (Episode {episode+1}/{args.n_episodes})")
+                print("-" * 60)
             else:
                 print(f"\n  [重试 {episode_retry_count}/{max_episode_retries}] Episode {episode+1}")
             
-            # 重置环境
-            states, spawned_objects = env.reset()
-            print(f"  [环境状态] 生成成功")
+            # 重置环境 (传入 force_task_config)
+            states, spawned_objects = env.reset(force_task_config=force_task_config)
+            print(f"  [环境状态] 生成成功 (MAML {phase_name} Set)")
             
+            # [MAML] 如果是 Query 阶段，获取 fast_weights 用于推理
+            fast_weights = None
+            if not is_support and current_task_id in agent.replay_buffer.buffer:
+                support_data = agent.replay_buffer.buffer[current_task_id]['support']
+                if support_data:
+                    print(f"\n  >> [Inner-Loop] 正在执行快速适应 (Fast Weights Adaptation) ...")
+                    fast_weights = agent.adapt(support_data, first_order=True)
+                    print(f"  >> [Inner-Loop] 适应完成，获取到 Task-Specific 策略参数。")
+
             # [显存优化] Reset后立即清理GPU缓存
             torch.cuda.empty_cache()
             
@@ -245,7 +286,7 @@ def main():
                 for env_idx in range(args.num_envs):
                     state = states[env_idx:env_idx+1]  # (1, 3, 320, 320)
                     
-                    action, strategy_type = agent.select_action(state, epsilon, invalid_actions=invalid_actions_list[env_idx], env_idx=env_idx, debug=debug_print)
+                    action, strategy_type = agent.select_action(state, epsilon, invalid_actions=invalid_actions_list[env_idx], fast_weights=fast_weights)
                     actions.append(action)
                     strategy_types.append(strategy_type)
                     
@@ -335,15 +376,10 @@ def main():
                     })
 
                 
-                # 训练
+                # [MAML] 替换为 Meta-Update 逻辑
+                # 将本 Episode 存入 Buffer，但在 Episode 结束后批量存入
+                # 所以每步的在线训练被移除，改为 Episode 级别的 Meta-Update
                 step_loss = None
-                buffer_size = len(agent.replay_buffer)
-                if buffer_size >= 4:
-                    dynamic_batch_size = min(buffer_size, args.batch_size)
-                    step_loss = agent.train_step(batch_size=dynamic_batch_size)
-                    if step_loss is not None:
-                        train_loss_buffer.append(step_loss)
-                    torch.cuda.empty_cache()
                 
                 # 更新目标网络（基于有效步数）
                 # 注意：global_step在episode有效结束后才更新，这里用临时计算的step数
@@ -398,7 +434,9 @@ def main():
                 # Episode有效，提交所有临时经验
                 episode_valid = True
                 for exp in episode_experiences:
-                    agent.store_transition(
+                    agent.replay_buffer.push(
+                        task_id=current_task_id,
+                        is_support=is_support,
                         state=exp['state'],
                         action=exp['action'],
                         reward=exp['reward'],
@@ -406,6 +444,18 @@ def main():
                         done=exp['done']
                     )
                 episode_experiences.clear()
+                
+                # [MAML] 在 Query 阶段结束后，执行 Meta Update
+                if not is_support and len(agent.replay_buffer) >= task_batch_size:
+                    print(f"\n" + "=" * 80)
+                    meta_iter = (current_task_id - 1) // task_batch_size + 1
+                    print(f"[Outer-Loop: Meta-Iteration {meta_iter}] 收集完毕。执行元更新 (Meta-Update) ...")
+                    print(f"  >> 当前 Buffer Task 数量: {len(agent.replay_buffer)}")
+                    sampled_tasks = agent.replay_buffer.sample_tasks(task_batch_size)
+                    meta_loss = agent.meta_update(sampled_tasks, first_order=True)  # 默认降级为FOMAML以防escnn报错
+                    print(f"  >> Meta Loss: {meta_loss:.4f}")
+                    train_loss_buffer.append(meta_loss)
+                    print("=" * 80 + "\n")
         
         # 如果重试次数用尽仍然失败
         if not episode_valid:
@@ -492,8 +542,9 @@ def main():
     print(f"训练完成！最终模型已保存到: {final_path}")
     print("=" * 80)
     
-    # 关闭仿真
-    scene.simulation_app.close()
+    # [Isaac Sim Fix] 使用 os._exit(0) 强制结束进程，
+    # 避免 simulation_app.close() 在清理 Replicator/SyntheticData 图节点时出现无限报错。
+    os._exit(0)
 
 
 if __name__ == "__main__":

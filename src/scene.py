@@ -668,16 +668,12 @@ class Scene:
             if stage.GetPrimAtPath(prim_path).IsValid():
                 stage.RemovePrim(prim_path)
             spawned_objects.remove(obj)
-        
-        # if env_ids_to_delete is None:
-        #     print(f"  已删除 {len(objects_to_remove)} 个物体 (全部环境)")
-        # else:
-        #     print(f"  已删除 {len(objects_to_remove)} 个物体 (环境: {env_ids_to_delete})")
 
-    def create_clutter_environment(self, num_objects_range, workspace_limits=None, env_ids=None):
+    def create_clutter_environment(self, num_objects_range, workspace_limits=None, env_ids=None, force_task_config=None):
         """
         [功能]: 在指定环境中随机生成杂乱物体
         [输入]: num_objects_range (int/tuple), workspace_limits (Tensor), env_ids (list/None)
+                force_task_config (dict/None): 强制设定的任务配置，包含 target_pos 和 obstacle_positions
         [输出]: spawned_objects (List[RigidObject])
         """
         import os, random, torch, numpy as np
@@ -718,8 +714,22 @@ class Scene:
                 # ========== [固定位置模式] ==========
                 # 所有环境共享同一个位置配置，仅角度随机
                 
-                # 检查是否已有全局缓存配置（所有环境共用）
-                if not hasattr(self, '_global_spawn_config'):
+                # 检查是否已有全局缓存配置（所有环境共用）或传入了强制配置
+                if force_task_config is not None:
+                    # 使用传入的 MAML Task 配置
+                    n_obstacles = len(force_task_config['obstacle_positions'])
+                    target_model_name = random.choice(available_target_models)
+                    available_obstacle_models = [m for m in available_models if m != target_model_name]
+                    random.shuffle(available_obstacle_models)
+                    selected_obstacle_models = available_obstacle_models[:n_obstacles]
+                    
+                    self._global_spawn_config = {
+                        'target_model': target_model_name,
+                        'target_pos': force_task_config['target_pos'],
+                        'obstacle_models': selected_obstacle_models,
+                        'obstacle_positions': force_task_config['obstacle_positions']
+                    }
+                elif not hasattr(self, '_global_spawn_config'):
                     # 首次生成全局配置（只生成一次）
                     n_total = num_objects_range if isinstance(num_objects_range, int) else random.randint(*num_objects_range)
                     n_obstacles = n_total - 1

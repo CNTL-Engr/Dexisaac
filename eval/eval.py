@@ -503,11 +503,8 @@ def main():
 
     print(f"\n✓ 评估日志已保存到: {log_path}")
 
-    # 关闭仿真
-    scene.simulation_app.close()
-
-    # 强制退出进程：Isaac Sim 的后台线程可能阻止进程正常退出，
-    # 导致 batch_eval.sh 无法继续执行下一次评估
+    # 使用 os._exit(0) 强制结束进程，
+    # 避免 simulation_app.close() 在清理 Replicator/SyntheticData 图节点时出现无限报错。
     os._exit(0)
 
 

@@ -54,10 +54,11 @@ class PushEnv:
         # IK失败黑名单：记录失败环境，强制清零或制
         self.ik_failed_blacklist = set()  # 存储env_idx
         
-    def reset(self, env_indices=None):
+    def reset(self, env_indices=None, force_task_config=None):
         '''
         [功能]: 重置环境
         [输入]: env_indices (list): 要重置的环境索引列表
+                force_task_config (dict): MAML 的特定任务配置
         [输出]: states (torch.Tensor): 重置后的环境状态
         '''
         if env_indices is None:
@@ -69,10 +70,11 @@ class PushEnv:
             self.spawned_objects = None
         
         # 重置 scene（清除缓存配置，确保每轮重新随机生成物体数量和布局）
-        if hasattr(self.scene, '_global_spawn_config'):
+        if force_task_config is None and hasattr(self.scene, '_global_spawn_config'):
             del self.scene._global_spawn_config
         spawned_objects = self.scene.create_clutter_environment(
-            num_objects_range=(self.num_objects_min,self.num_objects_max)   
+            num_objects_range=(self.num_objects_min,self.num_objects_max),
+            force_task_config=force_task_config
         )
         
         # 保存物体引用
