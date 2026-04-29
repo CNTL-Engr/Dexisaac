@@ -36,176 +36,282 @@ from pushnet import EquivariantPushNet
 from pushnet_cnn import CNNPushNet
 
 
-class QuadrantTaskGenerator:
+class ObstacleCountTaskGenerator:
     """
-    [功能]: 基于象限障碍物密度的 MAML 子任务生成器。
+    [功能]: 基于"障碍物总数量"递增的 MAML 子任务生成器。
 
-    [坐标系定义]:
-      - 初始局部坐标系: 原点 = P_target, X轴 = 从 P_base 指向 P_target 的方向 (远离基座),
-        Y轴 = X轴逆时针 90° (右手定则)。
-      - 实际坐标系: 在初始局部坐标系的基础上，X轴和Y轴同时绕 Z 轴逆时针旋转 135° (3π/4 rad)。
+    通过逐步增加场上障碍物的数量来划分子任务难度，
+    让 Agent 从简单场景（少量障碍物）逐步过渡到复杂场景（多量障碍物）。
 
-    [子任务定义] (5 种拓扑分布):
-      Task 0 (Q1 Blocked): Q1 稠密
-      Task 1 (Q2 Blocked): Q2 稠密
-      Task 2 (Q3 Blocked): Q3 稠密
-      Task 3 (Q4 Blocked): Q4 稠密
-      Task 4 (Dense Clutter): 四个象限均匀稠密
+    [子任务定义] (4 种难度等级):
+      Task 0: 生成 3 个障碍物 (最简单)
+      Task 1: 生成 4 个障碍物
+      Task 2: 生成 5 个障碍物
+      Task 3: 生成 6 个障碍物 (最复杂)
+
+    [模型文件夹]:
+      每个子任务可以指定独立的障碍物模型文件夹和目标物体模型文件夹。
+      通过构造函数的 model_dirs 参数或 set_task_model_dirs 方法设置。
+
+    [坐标生成]:
+      使用纯 Numpy + math 库，以目标物体为圆心，在半径范围内
+      均匀随机采样障碍物坐标，并带有防碰撞检测。
     """
 
-    NUM_TASKS = 5  # 固定 5 种子任务
+    NUM_TASKS = 4  # 固定 4 种子任务（Task 0-3）
+
+    # 障碍物数量基数：Task 0 对应 3 个障碍物
+    BASE_OBSTACLE_COUNT = 3
 
     # 各 Task 的名称（用于打印/日志）
     TASK_NAMES = {
-        0: "Q1 Blocked",
-        1: "Q2 Blocked",
-        2: "Q3 Blocked",
-        3: "Q4 Blocked",
-        4: "Dense Clutter",
+        0: "3 Obstacles",
+        1: "4 Obstacles",
+        2: "5 Obstacles",
+        3: "6 Obstacles",
     }
 
-    def __init__(self, radius=0.21, min_dist=0.06, max_attempts=1000):
+    # 默认模型文件夹路径
+    _DEFAULT_OBSTACLE_DIR = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_CH"
+    _DEFAULT_TARGET_DIR = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_target"
+
+    def __init__(self, radius=0.21, min_dist=0.06, max_attempts=1000, model_dirs=None):
+        """
+        [参数]:
+          radius       : 障碍物分布的最大半径（以目标物体为圆心）
+          min_dist     : 障碍物中心之间的最小间距（防穿模）
+          max_attempts : 单个障碍物放置时的最大尝试次数
+          model_dirs   : 每个子任务使用的模型文件夹配置 (dict 或 None)
+                         格式: { task_id: { 'obstacle_dir': '路径', 'target_dir': '路径' }, ... }
+                         未指定的 task_id 将使用默认路径。
+                         也可以只指定其中一个 key（obstacle_dir 或 target_dir），另一个使用默认值。
+
+        [示例]:
+          model_dirs = {
+              0: {'obstacle_dir': '/path/to/simple_models',  'target_dir': '/path/to/targets'},
+              1: {'obstacle_dir': '/path/to/medium_models', 'target_dir': '/path/to/targets'},
+              2: {'obstacle_dir': '/path/to/complex_models'},  # target_dir 使用默认
+          }
+        """
         self.radius = radius
-        self.min_dist = min_dist  # 障碍物中心之间的最小距离 (防穿模)
+        self.min_dist = min_dist
         self.max_attempts = max_attempts
 
+        # 初始化每个 Task 的模型文件夹配置
+        self._task_model_dirs = {}
+        for tid in range(self.NUM_TASKS):
+            self._task_model_dirs[tid] = {
+                'obstacle_dir': self._DEFAULT_OBSTACLE_DIR,
+                'target_dir': self._DEFAULT_TARGET_DIR,
+            }
+
+        # 如果用户传入了自定义配置，合并覆盖默认值
+        if model_dirs is not None:
+            self.set_task_model_dirs(model_dirs)
+
     # ------------------------------------------------------------------ #
-    #  任务分配逻辑
+    #  核心方法：根据 task_id 计算障碍物数量
     # ------------------------------------------------------------------ #
-    def get_task_distribution(self, task_id, total_obstacles):
+    def get_obstacle_count(self, task_id):
         """
-        [功能]: 根据 task_id 计算各象限的障碍物数量四元组 (n1, n2, n3, n4)
-        [规则]:
-          - Task 0-3: 稠密象限获得 ~60% 的障碍物, 其余 3 个象限均分剩余。
-          - Task 4: 四个象限均匀分配。
-        [输入]: task_id (0-4), total_obstacles (int)
-        [输出]: tuple (n1, n2, n3, n4)
+        [功能]: 根据 task_id 计算需要生成的障碍物数量 N
+        [公式]: N = BASE_OBSTACLE_COUNT + task_id
+        [输入]: task_id (int, 0-3)
+        [输出]: int, 障碍物数量
+
+        [边界情况]:
+          - task_id 超出 [0, NUM_TASKS-1] 范围时，自动裁剪到合法区间
         """
-        if task_id == 4:
-            # Dense Clutter: 均匀分配
-            base = total_obstacles // 4
-            remainder = total_obstacles % 4
-            counts = [base] * 4
-            # 将余数随机散布
-            indices = list(range(4))
-            random.shuffle(indices)
-            for i in range(remainder):
-                counts[indices[i]] += 1
-            return tuple(counts)
-        else:
-            # Task 0-3: 指定象限稠密
-            dense_q = task_id  # 稠密象限索引 (0-3)
-            n_dense = max(1, round(total_obstacles * 0.6))
-            n_rest = total_obstacles - n_dense
+        # 边界检查：将 task_id 限制在有效范围内
+        clamped_id = max(0, min(task_id, self.NUM_TASKS - 1))
+        if clamped_id != task_id:
+            print(f"[ObstacleCountTaskGenerator] 警告: task_id={task_id} 超出范围 [0, {self.NUM_TASKS - 1}]，"
+                  f"已裁剪为 {clamped_id}")
 
-            counts = [0, 0, 0, 0]
-            counts[dense_q] = n_dense
+        # 障碍物数量 = 基数 + task_id
+        return self.BASE_OBSTACLE_COUNT + clamped_id
 
-            # 其余 3 个象限均分剩余
-            other_qs = [q for q in range(4) if q != dense_q]
-            base = n_rest // 3
-            remainder = n_rest % 3
-            random.shuffle(other_qs)
-            for i, q in enumerate(other_qs):
-                counts[q] = base + (1 if i < remainder else 0)
-
-            return tuple(counts)
-
-    def sample_task(self, total_obstacles=4):
+    # ------------------------------------------------------------------ #
+    #  任务采样接口（兼容原有 MAML 训练循环）
+    # ------------------------------------------------------------------ #
+    def sample_task(self, **kwargs):
         """
-        [功能]: 随机采样一个 task_id (0-4) 并返回其四元组分布
-        [输出]: (task_id, task_tuple, task_name)
+        [功能]: 随机采样一个 task_id (0-3) 并返回障碍物数量
+        [输出]: (task_id, obstacle_count, task_name)
+                - task_id: 子任务编号 (0-3)
+                - obstacle_count: 对应的障碍物数量 (4-7)
+                - task_name: 任务名称字符串
+        [说明]: **kwargs 用于兼容旧接口（如 total_obstacles 参数），实际不使用
         """
         task_id = random.randint(0, self.NUM_TASKS - 1)
-        task_tuple = self.get_task_distribution(task_id, total_obstacles)
-        return task_id, task_tuple, self.TASK_NAMES[task_id]
+        obstacle_count = self.get_obstacle_count(task_id)
+        return task_id, obstacle_count, self.TASK_NAMES[task_id]
 
-    def get_task_by_id(self, task_id, total_obstacles=4):
+    def get_task_by_id(self, task_id):
         """
-        [功能]: 获取指定 task_id 的四元组分布
-        [输出]: (task_tuple, task_name)
+        [功能]: 获取指定 task_id 的障碍物数量和名称
+        [输入]: task_id (int, 0-3)
+        [输出]: (obstacle_count, task_name)
         """
-        task_tuple = self.get_task_distribution(task_id, total_obstacles)
-        return task_tuple, self.TASK_NAMES[task_id]
+        obstacle_count = self.get_obstacle_count(task_id)
+        return obstacle_count, self.TASK_NAMES[task_id]
 
     # ------------------------------------------------------------------ #
-    #  坐标生成
+    #  模型文件夹管理
     # ------------------------------------------------------------------ #
-    def generate_positions_for_task(self, target_pos, robot_pos, task_tuple):
+    def set_task_model_dirs(self, model_dirs):
         """
-        [功能]: 根据任务四元组生成具体的障碍物坐标
-        [输入]: target_pos: 目标物体中心 [x_t, y_t, z_t]
-                robot_pos: 机器人基座中心 [x_r, y_r, z_r]
-                task_tuple: (n1, n2, n3, n4)
-        [输出]: List[[x, y, z]] 障碍物的位置列表
+        [功能]: 设置/更新各子任务使用的模型文件夹
+        [输入]: model_dirs (dict)
+                格式: { task_id: { 'obstacle_dir': '路径', 'target_dir': '路径' }, ... }
+                只需传入需要修改的 task_id，未传入的保持不变。
+                每个 task_id 的 dict 中也只需传入需要修改的 key。
         """
-        xt, yt = target_pos[0], target_pos[1]
-        xr, yr = robot_pos[0], robot_pos[1]
+        for tid, dirs in model_dirs.items():
+            tid = int(tid)
+            if tid < 0 or tid >= self.NUM_TASKS:
+                print(f"[ObstacleCountTaskGenerator] 警告: model_dirs 中的 task_id={tid} "
+                      f"超出范围 [0, {self.NUM_TASKS - 1}]，已忽略")
+                continue
+            if 'obstacle_dir' in dirs:
+                self._task_model_dirs[tid]['obstacle_dir'] = dirs['obstacle_dir']
+            if 'target_dir' in dirs:
+                self._task_model_dirs[tid]['target_dir'] = dirs['target_dir']
 
-        # 1. 计算初始 X 轴向量 (基座 -> 目标物体, 即远离基座的方向)
-        vx, vy = xt - xr, yt - yr
-        norm = math.hypot(vx, vy)
-        if norm < 1e-6:
-            vx, vy = 1.0, 0.0
-            norm = 1.0
+    def get_model_dirs(self, task_id):
+        """
+        [功能]: 获取指定 task_id 使用的模型文件夹路径
+        [输入]: task_id (int, 0-3)
+        [输出]: dict, {'obstacle_dir': '路径', 'target_dir': '路径'}
+        """
+        clamped_id = max(0, min(task_id, self.NUM_TASKS - 1))
+        return self._task_model_dirs[clamped_id].copy()
 
-        ux, uy = vx / norm, vy / norm  # 初始 X 轴
+    def print_model_dirs_config(self):
+        """
+        [功能]: 打印所有子任务的模型文件夹配置（用于调试/日志）
+        """
+        print("[ObstacleCountTaskGenerator] 各子任务模型文件夹配置:")
+        for tid in range(self.NUM_TASKS):
+            dirs = self._task_model_dirs[tid]
+            print(f"  Task {tid} ({self.TASK_NAMES[tid]}):")
+            print(f"    障碍物模型: {dirs['obstacle_dir']}")
+            print(f"    目标物体模型: {dirs['target_dir']}")
 
-        # 2. 坐标系旋转 135° (逆时针)
-        angle = math.radians(135)
-        cos_a, sin_a = math.cos(angle), math.sin(angle)
+    # ------------------------------------------------------------------ #
+    #  坐标生成（纯 Numpy + math 实现）
+    # ------------------------------------------------------------------ #
+    def generate_positions_for_task(self, target_pos, robot_pos, obstacle_count):
+        """
+        [功能]: 根据障碍物数量，以目标物体为圆心，在环形区域内
+                均匀随机生成障碍物的 2D 坐标，并附带防碰撞检测。
 
-        # 任务坐标系 X 轴 (X_task)
-        x_task_dx = ux * cos_a - uy * sin_a
-        x_task_dy = ux * sin_a + uy * cos_a
+        [输入]:
+          target_pos     : 目标物体中心位置 [x_t, y_t, z_t] (list 或 np.ndarray)
+          robot_pos      : 机器人基座中心位置 [x_r, y_r, z_r] (list 或 np.ndarray)
+          obstacle_count : 需要生成的障碍物数量 N (int)
 
-        # 任务坐标系 Y 轴 (Y_task) = X_task 逆时针 90°
-        y_task_dx = -x_task_dy
-        y_task_dy = x_task_dx
+        [输出]:
+          List[ [x, y, z] ]  —— 标准 Python 列表，内含 list 形式的 2D+Z 坐标
 
-        # ---- 辅助函数: 在象限扇形内均匀采样 ---- #
-        def sample_point_in_quadrant(q_idx):
-            # 面积均匀: r = sqrt(U) * R, 留出 0.05m 内圈
-            r = math.sqrt(random.uniform((0.05 / self.radius) ** 2, 1.0)) * self.radius
+        [算法细节]:
+          1. 以目标物体 (x_t, y_t) 为圆心
+          2. 在 [r_inner, r_outer] 的环形区域内面积均匀采样
+          3. 角度在 [0, 2π) 上均匀分布
+          4. 防碰撞：新点与已有点的欧氏距离 >= min_dist
+          5. 若单点放置失败（超过 max_attempts 次），打印警告并强制放置
 
-            # 象限角度范围 (每象限 90°)
-            base_angles = [0.0, math.pi / 2, math.pi, 3 * math.pi / 2]
-            local_angle = base_angles[q_idx] + random.uniform(0, math.pi / 2)
+        [边界情况]:
+          - obstacle_count <= 0 时，返回空列表
+          - obstacle_count 极大导致空间不足时，会打印警告
+        """
+        # ---- 边界检查：障碍物数量非正时直接返回空列表 ---- #
+        if obstacle_count <= 0:
+            print("[ObstacleCountTaskGenerator] 警告: obstacle_count <= 0，返回空列表")
+            return []
 
-            local_x = r * math.cos(local_angle)
-            local_y = r * math.sin(local_angle)
+        # ---- 提取目标物体的 XY 坐标和 Z 高度 ---- #
+        xt = float(target_pos[0])
+        yt = float(target_pos[1])
+        zt = float(target_pos[2])  # 障碍物的 Z 高度与目标物体保持一致
 
-            global_x = xt + local_x * x_task_dx + local_y * y_task_dx
-            global_y = yt + local_x * x_task_dy + local_y * y_task_dy
+        # ---- 采样参数 ---- #
+        r_inner = 0.05   # 内圈安全距离 (米), 避免与目标物体重叠
+        r_outer = self.radius  # 外圈最大半径
 
-            return [global_x, global_y, target_pos[2]]
+        # ---- 辅助函数: 在环形区域内面积均匀采样单个点 ---- #
+        def _sample_one_point():
+            """
+            [功能]: 在以 (xt, yt) 为圆心的环形区域内采样一个点
+            [算法]: 面积均匀采样 r = sqrt(U * (R^2 - r_inner^2) + r_inner^2)
+                    角度 θ ~ Uniform(0, 2π)
+            [输出]: numpy.ndarray, shape=(2,), 全局 XY 坐标
+            """
+            # 面积均匀采样半径
+            u = np.random.uniform(0.0, 1.0)
+            r = math.sqrt(u * (r_outer ** 2 - r_inner ** 2) + r_inner ** 2)
 
-        # 3. 按四元组生成所有点，带防碰撞检测
-        obstacle_positions = []
-        existing_pts = [[xt, yt]]  # 目标物体本身也算已占用
+            # 均匀采样角度
+            theta = np.random.uniform(0.0, 2.0 * math.pi)
 
-        for q_idx, count in enumerate(task_tuple):
-            for _ in range(count):
-                placed = False
-                for _ in range(self.max_attempts):
-                    pt = sample_point_in_quadrant(q_idx)
+            # 转换为直角坐标（全局坐标系）
+            px = xt + r * math.cos(theta)
+            py = yt + r * math.sin(theta)
 
-                    collision = any(
-                        math.hypot(pt[0] - ex[0], pt[1] - ex[1]) < self.min_dist
-                        for ex in existing_pts
-                    )
-                    if not collision:
-                        obstacle_positions.append(pt)
-                        existing_pts.append([pt[0], pt[1]])
-                        placed = True
-                        break
+            return np.array([px, py])
 
-                if not placed:
-                    print(f"[TaskGenerator] 警告：在象限 Q{q_idx+1} 找不到防碰撞的安放点！")
-                    obstacle_positions.append(pt)
-                    existing_pts.append([pt[0], pt[1]])
+        # ---- 防碰撞检测函数 ---- #
+        def _has_collision(new_pt_xy, existing_pts_xy):
+            """
+            [功能]: 检查新点是否与已有点集中的任何点碰撞
+            [输入]: new_pt_xy   : numpy.ndarray, shape=(2,)
+                    existing_pts_xy : list of numpy.ndarray, 每个 shape=(2,)
+            [输出]: bool, True 表示存在碰撞
+            """
+            for ex_pt in existing_pts_xy:
+                dist = np.linalg.norm(new_pt_xy - ex_pt)
+                if dist < self.min_dist:
+                    return True
+            return False
+
+        # ---- 主循环：逐个放置障碍物 ---- #
+        obstacle_positions = []         # 最终输出：[x, y, z] 列表
+        existing_xy = [np.array([xt, yt])]  # 已占用的 XY 坐标列表（包含目标物体）
+
+        for i in range(obstacle_count):
+            placed = False
+            last_pt_xy = None
+
+            for _ in range(self.max_attempts):
+                pt_xy = _sample_one_point()
+                last_pt_xy = pt_xy
+
+                # 防碰撞检测
+                if not _has_collision(pt_xy, existing_xy):
+                    # 无碰撞，成功放置
+                    obstacle_positions.append([float(pt_xy[0]), float(pt_xy[1]), zt])
+                    existing_xy.append(pt_xy)
+                    placed = True
+                    break
+
+            # 如果超过最大尝试次数仍未找到合法位置，强制放置最后一次采样的点
+            if not placed:
+                print(f"[ObstacleCountTaskGenerator] 警告: 第 {i+1}/{obstacle_count} 个障碍物"
+                      f"在 {self.max_attempts} 次尝试后仍未找到无碰撞位置，强制放置！")
+                if last_pt_xy is not None:
+                    obstacle_positions.append([float(last_pt_xy[0]), float(last_pt_xy[1]), zt])
+                    existing_xy.append(last_pt_xy)
+                else:
+                    # 极端兜底：放在目标物体正上方偏移位置
+                    fallback_xy = np.array([xt + r_inner * 2, yt])
+                    obstacle_positions.append([float(fallback_xy[0]), float(fallback_xy[1]), zt])
+                    existing_xy.append(fallback_xy)
 
         return obstacle_positions
+
+
+# ---- 保留旧名称兼容性别名 ---- #
+QuadrantTaskGenerator = ObstacleCountTaskGenerator
 
 
 class TaskReplayBuffer:

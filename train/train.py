@@ -19,7 +19,7 @@ sys.path.insert(0, src_path)
 sys.path.insert(0, train_path)
 
 from scene import Scene
-from maml_dqn import MAMLDQNAgent, QuadrantTaskGenerator
+from maml_dqn import MAMLDQNAgent, ObstacleCountTaskGenerator
 from env_wrapper import PushEnv
 from utils import print_training_log, compute_epsilon, generate_checkpoint_dir
 
@@ -30,7 +30,7 @@ def parse_args():
     # 环境参数
     parser.add_argument('--num_envs', default=1, type=int, help='并行环境数量')
     parser.add_argument('--num_objects_min', default=4, type=int, help='最小物体数')
-    parser.add_argument('--num_objects_max', default=4, type=int, help='最大物体数')
+    parser.add_argument('--num_objects_max', default=7, type=int, help='最大物体数') # 物体数由 MAML Task 控制, 仅用于命名检查点文件夹
     parser.add_argument('--episode_max_steps', default=8, type=int, help='每个 episode 最大步数')
     parser.add_argument('--headless', action='store_true', default=True, help='无界面模式 (默认开启)')
     parser.add_argument('--no-headless', dest='headless',default=False, action='store_false', help='启用可视化界面')
@@ -42,19 +42,19 @@ def parse_args():
     parser.add_argument('--gamma', default=0.99, type=float, help='折扣因子')
     parser.add_argument('--epsilon_start', default=0.8, type=float, help='初始探索率')
     parser.add_argument('--epsilon_end', default=0.08, type=float, help='最终探索率')
-    parser.add_argument('--epsilon_decay_steps', default=9000, type=int, help='探索衰减步数')
+    parser.add_argument('--epsilon_decay_steps', default=8000, type=int, help='探索衰减步数')
     parser.add_argument('--target_update_freq', default=10, type=int, help='目标网络更新频率(步数)')
     parser.add_argument('--replay_buffer_size', default=18000, type=int, help='经验池大小')
     parser.add_argument('--min_buffer_size', default=16, type=int, help='开始训练的最小经验数')
     
     # 保存参数
     parser.add_argument('--save_every', default=50, type=int, help='保存频率(episodes)')
-    parser.add_argument('--checkpoint_base_dir', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results', type=str, help='检查点根目录（将自动生成子目录名）')
-    parser.add_argument('--save_intermediate', action='store_true', default=True, help='是否保存中间模型（默认关闭，只保存最终模型）')
+    parser.add_argument('--checkpoint_base_dir', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/increase_obs_subtasks', type=str, help='检查点根目录（将自动生成子目录名）')
+    parser.add_argument('--save_intermediate', action='store_true', default=True, help='是否保存中间模型')
     
     # 模型加载参数
-    parser.add_argument('--load_model', action='store_true', default=True, help='是否加载预训练模型')
-    parser.add_argument('--model_path', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_4/model_final.pth', type=str, help='预训练模型路径')
+    parser.add_argument('--load_model', action='store_true', default=False, help='是否加载预训练模型')
+    parser.add_argument('--model_path', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/equi_obj_4/model_final.pth', type=str, help='预训练模型路径')
     parser.add_argument('--use_equivariant', action='store_true', default=True, help='是否使用C4等变网络（默认开启）')
     parser.add_argument('--device', type=str, default='cuda', help='设备: cuda 或 cpu')
     parser.add_argument('--seed', default=42, type=int, help='随机种子')
@@ -119,9 +119,21 @@ def main():
         use_equivariant=args.use_equivariant
     )
     
-    task_generator = QuadrantTaskGenerator(radius=0.21)
+    task_generator = ObstacleCountTaskGenerator(radius=0.21)
+    
+    # [可选] 为每个子任务指定不同的物体模型文件夹，取消注释下面的代码并修改路径:
+    task_generator.set_task_model_dirs({
+        0: {'obstacle_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_3obs', 'target_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_target'},
+        1: {'obstacle_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_4obs', 'target_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_target'},
+        2: {'obstacle_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_5obs', 'target_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_target'},
+        3: {'obstacle_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_6obs', 'target_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_target'},
+    })
+    
+    # 打印当前模型文件夹配置
+    task_generator.print_model_dirs_config()
+    
     current_task_id = 0
-    task_batch_size = 5  # 5 种子任务 (Q1-Q4 Blocked + Dense Clutter) 为一个 Meta-Iteration
+    task_batch_size = 4  # 4 种子任务 (3-6 个障碍物) 为一个 Meta-Iteration
     
     # [模型加载] 如果指定加载预训练模型
     if args.load_model:
@@ -195,14 +207,16 @@ def main():
             # [MAML] 决定当前是 Support 还是 Query 阶段
             is_support = (episode % 2 == 0)
             if is_support:
-                # 采样新任务 (返回 task_id, 四元组, 任务名称)
-                sampled_task_id, task_tuple, task_name = task_generator.sample_task(
-                    total_obstacles=args.num_objects_max - 1
-                )
-                current_task_id += 1
+                if episode_retry_count == 1:
+                    current_task_id += 1
+                
+                # 按照 Task 0 到 Task 3 的顺序选取子任务
+                sampled_task_id = (current_task_id - 1) % task_batch_size
+                obstacle_count, task_name = task_generator.get_task_by_id(sampled_task_id)
+                
                 phase_name = "Support"
                 
-                if current_task_id % task_batch_size == 1 or task_batch_size == 1:
+                if episode_retry_count == 1 and (current_task_id % task_batch_size == 1 or task_batch_size == 1):
                     meta_iter = (current_task_id - 1) // task_batch_size + 1
                     print("\n" + "=" * 80)
                     print(f"[Outer-Loop: Meta-Iteration {meta_iter}] 开始收集 {task_batch_size} 个子任务 (Tasks)")
@@ -213,17 +227,23 @@ def main():
             # [MAML] 生成任务布局
             target_pos = [0.75, 0.0, 0.06]
             robot_pos = [0.0, 0.0, 0.0]  # 假设基座原点
-            obstacle_positions = task_generator.generate_positions_for_task(target_pos, robot_pos, task_tuple)
+            obstacle_positions = task_generator.generate_positions_for_task(target_pos, robot_pos, obstacle_count)
+            
+            # 获取当前子任务对应的模型文件夹路径
+            task_model_dirs = task_generator.get_model_dirs(sampled_task_id)
+            
             force_task_config = {
                 'target_pos': target_pos,
-                'obstacle_positions': obstacle_positions
+                'obstacle_positions': obstacle_positions,
+                'obstacle_model_dir': task_model_dirs['obstacle_dir'],
+                'target_model_dir': task_model_dirs['target_dir'],
             }
             
             # Episode 开始标题
             if episode_retry_count == 1:
                 print("\n" + "-" * 60)
                 sub_task_idx = ((current_task_id - 1) % task_batch_size) + 1
-                print(f"  [Sub-Task {sub_task_idx}/{task_batch_size}] Task ID: {current_task_id} ({task_name}), Layout: {task_tuple}")
+                print(f"  [子任务 {sub_task_idx}/{task_batch_size}] 全局任务进度: {current_task_id} | 任务类型: Task {sampled_task_id} ({task_name}), 障碍物数量: {obstacle_count}")
                 print(f"  [{'Inner-Loop: Support Set' if is_support else 'Outer-Loop: Query Set'}] 收集数据 (Episode {episode+1}/{args.n_episodes})")
                 print("-" * 60)
             else:
@@ -445,10 +465,10 @@ def main():
                     )
                 episode_experiences.clear()
                 
-                # [MAML] 在 Query 阶段结束后，执行 Meta Update
-                if not is_support and len(agent.replay_buffer) >= task_batch_size:
+                # [MAML] 在 Query 阶段结束后，严格每收集齐 task_batch_size 个任务执行一次 Meta Update
+                if not is_support and current_task_id % task_batch_size == 0:
                     print(f"\n" + "=" * 80)
-                    meta_iter = (current_task_id - 1) // task_batch_size + 1
+                    meta_iter = current_task_id // task_batch_size
                     print(f"[Outer-Loop: Meta-Iteration {meta_iter}] 收集完毕。执行元更新 (Meta-Update) ...")
                     print(f"  >> 当前 Buffer Task 数量: {len(agent.replay_buffer)}")
                     sampled_tasks = agent.replay_buffer.sample_tasks(task_batch_size)

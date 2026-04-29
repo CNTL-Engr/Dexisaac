@@ -36,7 +36,7 @@ def parse_args():
 
     # 模型参数
     parser.add_argument('--model_path', type=str,
-                        default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_9/model_final.pth',
+                        default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/equi_obj_9/model_final.pth',
                         help='训练好的模型文件路径')
     parser.add_argument('--use_equivariant', action='store_true', default=True,
                         help='是否使用C4等变网络（默认开启）')
@@ -515,5 +515,5 @@ if __name__ == "__main__":
 # python eval/eval.py --model_path /path/to/model.pth --n_episodes 100 --seed 42
 
 # # 自定义参数
-# python eval.py --model_path /home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_9/model_final.pth --n_episodes 200 --seed 123 --episode_max_steps 8 --num_objects_min 7 --num_objects_max 9
-# python eval.py --model_path /home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_4/model_final.pth --n_episodes 500 --num_objects_min 4 --num_objects_max 4
+# python eval.py --model_path /home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/equi_obj_9/model_final.pth --n_episodes 200 --seed 123 --episode_max_steps 8 --num_objects_min 7 --num_objects_max 9
+# python eval.py --model_path /home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/equi_obj_4/model_final.pth --n_episodes 500 --num_objects_min 4 --num_objects_max 4

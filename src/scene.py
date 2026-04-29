@@ -694,8 +694,16 @@ class Scene:
 
         
         # Meshdata 数据集路径
-        ycb_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/meshdata_CH"
-        ycb_target_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/meshdata_target"
+        # [MAML] 如果 force_task_config 指定了模型文件夹，优先使用
+        if force_task_config is not None and 'obstacle_model_dir' in force_task_config:
+            ycb_root = force_task_config['obstacle_model_dir']
+        else:
+            ycb_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_CH"
+        
+        if force_task_config is not None and 'target_model_dir' in force_task_config:
+            ycb_target_root = force_task_config['target_model_dir']
+        else:
+            ycb_target_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_target"
         
         # 查找所有包含 textured.usd 的模型
         get_models = lambda root: [d for d in os.listdir(root) if os.path.exists(os.path.join(root, d, "textured.usd"))] if os.path.exists(root) else []

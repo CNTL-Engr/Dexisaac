@@ -26,7 +26,7 @@ NUM_OBJECTS_MAX=5
 EPISODE_MAX_STEPS=8
 
 # 模型路径
-MODEL_PATH="/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac/model_results/equi_obj_9/model_final.pth"
+MODEL_PATH="/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/equi_obj_9/model_final.pth"
 
 # 是否使用等变网络（默认开启）
 USE_EQUIVARIANT="--use_equivariant"

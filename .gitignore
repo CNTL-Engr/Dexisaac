@@ -16,6 +16,10 @@ meshdata_target/
 object/
 meshdata_CH/
 model_results/
+meshdata_3obs/
+meshdata_4obs/
+meshdata_5obs/
+meshdata_6obs/
 # 忽略原始模型数据文件
 meshdata*/
 *imgs*/
