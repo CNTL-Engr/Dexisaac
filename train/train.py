@@ -4,6 +4,7 @@ C6PushNet 强化学习训练脚本
 """
 
 import os
+import time
 import sys
 import argparse
 import gc
@@ -29,32 +30,34 @@ def parse_args():
     
     # 环境参数
     parser.add_argument('--num_envs', default=1, type=int, help='并行环境数量')
-    parser.add_argument('--num_objects_min', default=4, type=int, help='最小物体数')
-    parser.add_argument('--num_objects_max', default=7, type=int, help='最大物体数') # 物体数由 MAML Task 控制, 仅用于命名检查点文件夹
+    parser.add_argument('--num_objects_min', default=5, type=int, help='最小物体数')
+    parser.add_argument('--num_objects_max', default=8, type=int, help='最大物体数') # 物体数由 MAML Task 控制, 仅用于命名检查点文件夹
     parser.add_argument('--episode_max_steps', default=8, type=int, help='每个 episode 最大步数')
     parser.add_argument('--headless', action='store_true', default=True, help='无界面模式 (默认开启)')
     parser.add_argument('--no-headless', dest='headless',default=False, action='store_false', help='启用可视化界面')
     
     # 训练参数
-    parser.add_argument('--n_episodes', default=2000, type=int, help='总训练轮数')
+    parser.add_argument('--n_episodes', default=2800, type=int, help='总训练轮数')
+    parser.add_argument('--curriculum_interval', default=700, type=int, help='每隔多少轮增加一个障碍物')
     parser.add_argument('--batch_size', default=16, type=int, help='训练批大小')
     parser.add_argument('--learning_rate', default=1e-4, type=float, help='学习率')
     parser.add_argument('--gamma', default=0.99, type=float, help='折扣因子')
     parser.add_argument('--epsilon_start', default=0.8, type=float, help='初始探索率')
     parser.add_argument('--epsilon_end', default=0.08, type=float, help='最终探索率')
-    parser.add_argument('--epsilon_decay_steps', default=8000, type=int, help='探索衰减步数')
+    parser.add_argument('--epsilon_decay_steps', default=2800, type=int, help='探索衰减步数')
     parser.add_argument('--target_update_freq', default=10, type=int, help='目标网络更新频率(步数)')
     parser.add_argument('--replay_buffer_size', default=18000, type=int, help='经验池大小')
     parser.add_argument('--min_buffer_size', default=16, type=int, help='开始训练的最小经验数')
     
     # 保存参数
     parser.add_argument('--save_every', default=50, type=int, help='保存频率(episodes)')
-    parser.add_argument('--checkpoint_base_dir', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/increase_obs_subtasks', type=str, help='检查点根目录（将自动生成子目录名）')
+    parser.add_argument('--checkpoint_base_dir', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/bounding_box_judge_success/2_envs', type=str, help='检查点根目录（将自动生成子目录名）')
     parser.add_argument('--save_intermediate', action='store_true', default=True, help='是否保存中间模型')
     
     # 模型加载参数
-    parser.add_argument('--load_model', action='store_true', default=False, help='是否加载预训练模型')
-    parser.add_argument('--model_path', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/equi_obj_4/model_final.pth', type=str, help='预训练模型路径')
+    parser.add_argument('--load_model', action='store_true', default=True, help='是否加载预训练模型')
+    parser.add_argument('--model_path', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/pre_equi_obj_4/model_final.pth', type=str, help='预训练模型路径')
+    parser.add_argument('--resume_episode', default=0, type=int, help='从指定episode恢复训练（0=从头开始）')
     parser.add_argument('--use_equivariant', action='store_true', default=True, help='是否使用C4等变网络（默认开启）')
     parser.add_argument('--device', type=str, default='cuda', help='设备: cuda 或 cpu')
     parser.add_argument('--seed', default=42, type=int, help='随机种子')
@@ -121,6 +124,7 @@ def main():
     
     task_generator = ObstacleCountTaskGenerator(radius=0.21)
     
+    '''
     # [可选] 为每个子任务指定不同的物体模型文件夹，取消注释下面的代码并修改路径:
     task_generator.set_task_model_dirs({
         0: {'obstacle_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_3obs', 'target_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_target'},
@@ -128,15 +132,26 @@ def main():
         2: {'obstacle_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_5obs', 'target_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_target'},
         3: {'obstacle_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_6obs', 'target_dir': '/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_target'},
     })
-    
+    '''
+
     # 打印当前模型文件夹配置
     task_generator.print_model_dirs_config()
     
     current_task_id = 0
-    task_batch_size = 4  # 4 种子任务 (3-6 个障碍物) 为一个 Meta-Iteration
+    task_batch_size = 1  # 单子任务课程学习，每次只有 1 个子任务
+    prev_curriculum_level = -1  # 用于检测课程等级切换
     
     # [模型加载] 如果指定加载预训练模型
-    if args.load_model:
+    if args.resume_episode > 0:
+        # 恢复训练模式：从checkpoint恢复完整状态（含optimizer）
+        resume_path = os.path.join(args.checkpoint_dir, f"model_episode_{args.resume_episode}.pth")
+        if os.path.exists(resume_path):
+            agent.load(resume_path)
+            print(f"[Agent] ✓ 恢复训练: 从 Episode {args.resume_episode} 继续 ({resume_path})")
+        else:
+            print(f"❌ 错误: 恢复模型不存在: {resume_path}")
+            os._exit(1)
+    elif args.load_model:
         if args.model_path and os.path.exists(args.model_path):
             print(f"[Agent] 加载预训练模型: {args.model_path}")
             checkpoint = torch.load(args.model_path, map_location=args.device)
@@ -160,36 +175,60 @@ def main():
     print("[4/4] 开始训练...")
     print("=" * 80)
     
-    global_step = 0
+    # [恢复训练] 根据 resume_episode 估算已有的 global_step
+    start_episode = args.resume_episode
+    # 每个 episode 平均步数 ≈ episode_max_steps/2，用于估算 global_step
+    estimated_steps_per_episode = args.episode_max_steps * args.num_envs
+    global_step = start_episode * estimated_steps_per_episode // 2  # 保守估计
+    
+    # 恢复课程等级和 epsilon 对应的 task_start_step
+    if start_episode > 0:
+        resume_curriculum = min(start_episode // args.curriculum_interval, 3)
+        # 找到当前课程等级开始的 episode，然后估算 task_start_step
+        curriculum_start_ep = resume_curriculum * args.curriculum_interval
+        task_start_step = curriculum_start_ep * estimated_steps_per_episode // 2
+        prev_curriculum_level = resume_curriculum
+        current_task_id = start_episode // 2  # 每2个episode一个task
+        print(f"[恢复训练] Episode={start_episode}, 课程等级={resume_curriculum}, "
+              f"估算global_step={global_step}, task_start_step={task_start_step}")
+    else:
+        task_start_step = 0
+    
     episode_rewards_history = [] # Renamed to avoid conflict with episode_reward in loop
     train_loss_buffer = [] # Buffer for storing training losses
     
-    # [新增] 动作选择统计 (8个动作: 0-7)
+    # 动作选择统计 (8个动作: 0-7)
     action_counts = [0] * 8  # 总次数
     action_explore_counts = [0] * 8  # 探索次数
     action_exploit_counts = [0] * 8  # 利用次数
     success_count = 0  # 记录总成功次数
-    ik_failed_count = 0  # [新增] 记录IK失败次数（不计入成功率）
-    valid_task_count = 0  # [新增] 记录有效任务次数（排除IK失败）
+    ik_failed_count = 0  # 记录IK失败次数（不计入成功率）
+    valid_task_count = 0  # 记录有效任务次数（排除IK失败）
     
-    # [修改] 记录最近100次环境任务的成功/失败（每个环境算一次任务）
+    # 记录最近100次环境任务的成功/失败（每个环境算一次任务）
     from collections import deque
     import csv
     recent_100_env_results = deque(maxlen=100)  # 每个元素是True/False，表示单个环境的成功/失败
     
-    # [新增] CSV 数据记录
+    # CSV 数据记录
     csv_path = os.path.join(args.checkpoint_dir, "training_log.csv")
     os.makedirs(args.checkpoint_dir, exist_ok=True)  # 确保目录存在
-    csv_file = open(csv_path, 'w', newline='')
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(['episode', 'step', 'loss', 'reward'])  # 写入表头
-    print(f"[数据记录] 训练日志将保存到: {csv_path}")
+    if start_episode > 0 and os.path.exists(csv_path):
+        # 恢复训练时追加写入
+        csv_file = open(csv_path, 'a', newline='')
+        csv_writer = csv.writer(csv_file)
+        print(f"[数据记录] 训练日志追加到: {csv_path}")
+    else:
+        csv_file = open(csv_path, 'w', newline='')
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(['episode', 'step', 'loss', 'reward'])  # 写入表头
+        print(f"[数据记录] 训练日志将保存到: {csv_path}")
     
     # 为每个环境维护一个无效动作列表 (Invalid Action Suppression)
     invalid_actions_list = [[] for _ in range(args.num_envs)]
 
-    for episode in range(args.n_episodes):
-        # [新增] Episode重试循环（IK失败时重新开始）
+    for episode in range(start_episode, args.n_episodes):
+        # Episode重试循环（IK失败时重新开始）
         episode_retry_count = 0
         max_episode_retries = 5  # 最大重试次数
         episode_valid = False
@@ -206,20 +245,33 @@ def main():
             
             # [MAML] 决定当前是 Support 还是 Query 阶段
             is_support = (episode % 2 == 0)
+            
+            # [课程学习] 根据 episode 决定当前障碍物数量等级
+            curriculum_level = min(episode // args.curriculum_interval, 3)
+            sampled_task_id = curriculum_level
+            obstacle_count, task_name = task_generator.get_task_by_id(sampled_task_id)
+            
             if is_support:
                 if episode_retry_count == 1:
                     current_task_id += 1
                 
-                # 按照 Task 0 到 Task 3 的顺序选取子任务
-                sampled_task_id = (current_task_id - 1) % task_batch_size
-                obstacle_count, task_name = task_generator.get_task_by_id(sampled_task_id)
-                
                 phase_name = "Support"
                 
-                if episode_retry_count == 1 and (current_task_id % task_batch_size == 1 or task_batch_size == 1):
+                # [课程学习] 检测课程等级切换
+                if episode_retry_count == 1 and curriculum_level != prev_curriculum_level:
+                    prev_curriculum_level = curriculum_level
+                    task_start_step = global_step  # 重置相对步数，用于探索率重置
+                    print("\n" + "*" * 80)
+                    print(f"[课程学习] 等级切换 Level {curriculum_level}: 障碍物数量 = {obstacle_count} (Episode {episode+1})")
+                    print(f"  Task {sampled_task_id} ({task_name})")
+                    remaining = args.n_episodes - episode
+                    print(f"  剩余训练轮数: {remaining}")
+                    print("*" * 80)
+                
+                if episode_retry_count == 1:
                     meta_iter = (current_task_id - 1) // task_batch_size + 1
                     print("\n" + "=" * 80)
-                    print(f"[Outer-Loop: Meta-Iteration {meta_iter}] 开始收集 {task_batch_size} 个子任务 (Tasks)")
+                    print(f"[Outer-Loop: Meta-Iteration {meta_iter}] 收集子任务 (课程等级 {curriculum_level}, {obstacle_count} 障碍物)")
                     print("=" * 80)
             else:
                 phase_name = "Query"
@@ -242,15 +294,25 @@ def main():
             # Episode 开始标题
             if episode_retry_count == 1:
                 print("\n" + "-" * 60)
-                sub_task_idx = ((current_task_id - 1) % task_batch_size) + 1
-                print(f"  [子任务 {sub_task_idx}/{task_batch_size}] 全局任务进度: {current_task_id} | 任务类型: Task {sampled_task_id} ({task_name}), 障碍物数量: {obstacle_count}")
+                print(f"  [课程等级 {curriculum_level}] 全局任务进度: {current_task_id} | Task {sampled_task_id} ({task_name}), 障碍物数量: {obstacle_count}")
                 print(f"  [{'Inner-Loop: Support Set' if is_support else 'Outer-Loop: Query Set'}] 收集数据 (Episode {episode+1}/{args.n_episodes})")
                 print("-" * 60)
             else:
                 print(f"\n  [重试 {episode_retry_count}/{max_episode_retries}] Episode {episode+1}")
             
             # 重置环境 (传入 force_task_config)
+            reset_start = time.time()
             states, spawned_objects = env.reset(force_task_config=force_task_config)
+            reset_elapsed = time.time() - reset_start
+            if reset_elapsed > 60:
+                print(f"\n  ⚠ [超时] env.reset() 耗时 {reset_elapsed:.1f}s > 60s，强制重试...")
+                ik_failed_this_episode = True
+                episode_experiences.clear()
+                if hasattr(env.scene, '_global_spawn_config'):
+                    del env.scene._global_spawn_config
+                torch.cuda.empty_cache()
+                gc.collect()
+                continue  # 重试 while 循环
             print(f"  [环境状态] 生成成功 (MAML {phase_name} Set)")
             
             # [MAML] 如果是 Query 阶段，获取 fast_weights 用于推理
@@ -270,8 +332,7 @@ def main():
             env_rewards = [0.0] * args.num_envs  # 每个环境的累计奖励
             
             for step in range(args.episode_max_steps):
-                # [修复] 先使用当前的global_step，最后再递增
-                # 这样可以确保在global_step=0,10,20,30...时正确触发更新
+                step_start_time = time.time()  # 记录每步开始时间
 
                 # [新增] 动作前崩飞检测 - 检查物体是否已经崩飞
                 pre_check_exploded = False
@@ -293,8 +354,9 @@ def main():
                 #     for i in range(args.num_envs):
                 #         save_debug_images(global_step, states, env_idx=i)
 
-                # 计算当前epsilon
-                epsilon = compute_epsilon(global_step, args.epsilon_start, args.epsilon_end, args.epsilon_decay_steps)
+                # 计算当前epsilon (相对于当前子任务重置探索率)
+                relative_step = global_step - task_start_step
+                epsilon = compute_epsilon(relative_step, args.epsilon_start, args.epsilon_end, args.epsilon_decay_steps)
                 
                 # 选择动作（单流网络：只返回 u, v, direction）
                 actions = []
@@ -330,6 +392,19 @@ def main():
                     import traceback
                     traceback.print_exc()
                     raise  # 重新抛出异常以便调试
+                
+                # [超时检测] 单步执行超过60秒则判定卡死
+                step_elapsed = time.time() - step_start_time
+                if step_elapsed > 60:
+                    print(f"\n  ⚠ [超时] Step {step+1} 耗时 {step_elapsed:.1f}s > 60s，清理缓存并重试本Episode...")
+                    ik_failed_this_episode = True
+                    episode_experiences.clear()
+                    # 清理场景缓存，确保下次重新生成
+                    if hasattr(env.scene, '_global_spawn_config'):
+                        del env.scene._global_spawn_config
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    break  # 退出步骤循环，进入 while 重试
                 
                 # [关键] 检查是否有任何环境发生IK失败或崩飞
                 for env_idx in range(args.num_envs):

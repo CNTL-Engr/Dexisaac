@@ -6,8 +6,8 @@
     python plot_comparison.py --num_objects 4 --compare
     
     # 单独模式：只绘制指定模型的曲线
-    python plot_comparison.py --num_objects 4 --model cnn
-    python plot_comparison.py --num_objects 4 --model equi
+    python plot_comparison.py --num_objects 5 --model cnn
+    python plot_comparison.py --num_objects 5 --model equi
 
 输出:
     对比图保存到 results/comparison_plots/

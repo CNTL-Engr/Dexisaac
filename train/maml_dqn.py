@@ -44,10 +44,10 @@ class ObstacleCountTaskGenerator:
     让 Agent 从简单场景（少量障碍物）逐步过渡到复杂场景（多量障碍物）。
 
     [子任务定义] (4 种难度等级):
-      Task 0: 生成 3 个障碍物 (最简单)
-      Task 1: 生成 4 个障碍物
-      Task 2: 生成 5 个障碍物
-      Task 3: 生成 6 个障碍物 (最复杂)
+      Task 0: 生成 4 个障碍物 (最简单)
+      Task 1: 生成 5 个障碍物
+      Task 2: 生成 6 个障碍物
+      Task 3: 生成 7 个障碍物 (最复杂)
 
     [模型文件夹]:
       每个子任务可以指定独立的障碍物模型文件夹和目标物体模型文件夹。
@@ -60,15 +60,15 @@ class ObstacleCountTaskGenerator:
 
     NUM_TASKS = 4  # 固定 4 种子任务（Task 0-3）
 
-    # 障碍物数量基数：Task 0 对应 3 个障碍物
-    BASE_OBSTACLE_COUNT = 3
+    # 障碍物数量基数：Task 0 对应 4 个障碍物
+    BASE_OBSTACLE_COUNT = 4
 
     # 各 Task 的名称（用于打印/日志）
     TASK_NAMES = {
-        0: "3 Obstacles",
-        1: "4 Obstacles",
-        2: "5 Obstacles",
-        3: "6 Obstacles",
+        0: "4 Obstacles",
+        1: "5 Obstacles",
+        2: "6 Obstacles",
+        3: "7 Obstacles",
     }
 
     # 默认模型文件夹路径

@@ -372,8 +372,8 @@ class Scene:
                 positions = torch.stack([obj.data.root_pos_w[0] for obj in objs])
                 env_target_pos[eid] = torch.mean(positions, dim=0)
         
-        gather_steps = 50
-        gather_strength = 8.0  # [修改] 降低聚拢力，避免物体挤压后崩飞
+        gather_steps = 48
+        gather_strength = 6.0  # 降低聚拢力，避免物体挤压后崩飞
         
         for step in range(gather_steps):
             dt = self.sim.get_physics_dt()

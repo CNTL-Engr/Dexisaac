@@ -99,10 +99,9 @@ def print_step_log(step, max_steps, action_idx, invalid_actions, info,
     # 成功判定
     success = info.get('success', False)
     sep = info.get('separation_metrics', {})
-    sim_val = sep.get('similarity', 0.0)
-    thr_val = sep.get('threshold', 0.95)
+    detail_str = sep.get('threshold', '')  # detail_str
     print(f"  成功判定: {'✓ 成功' if success else '× 未成功'} "
-          f"(相似度: {sim_val:.2%}, 阈值: {thr_val})")
+          f"({detail_str})")
 
     # 空推判定
     is_empty = info.get('empty_push', False)

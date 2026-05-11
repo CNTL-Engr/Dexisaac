@@ -192,21 +192,9 @@ class PushEnv:
         if all(self.env_dones):
             print(f"[Sync-Reset] 所有环境已完成，触发全局重置...")
             
-            # 使用全局 reset (重新生成所有物体)
-            # 注意: 这里会生成全新的场景，增加多样性
-            new_states, _ = self.reset()
-            # self.env_dones is cleared in reset()
-            
-            # 由于 reset() 已经获取了新状态，直接使用
-            next_states = new_states
-            
-            # 对于Agent来说，这一步是 Episode 结束
-            # dones 保持为 True (传给Agent)，但在内部我们已经重置了
-            # 下一次 step 将从新状态开始
-        else:
-            # 6. 获取当前状态 (Next State)
-            # 对于等待中的环境，状态保持不变 (在 _execute_push_batch 中已处理位置保持)
-            next_states = self._get_observations(self.spawned_objects)
+            # [修复] 不再在此处调用 self.reset()，避免生成物体数量不符的场景。
+            # train.py 在下一个 episode 开头会调用 env.reset(force_task_config=...) 生成正确的场景。
+            # 这里只需要保证 next_states 不影响 Agent 决策即可（dones=True，不会被使用）。
         
         self.previous_target_pos = self._get_target_position(self.spawned_objects)
         
@@ -719,24 +707,7 @@ class PushEnv:
                 infos.append(info)
                 continue  # 跳过空推检测
             
-            # 3. 检查是否超过最大步数（仅在未出界且未成功时）
-            if current_step >= self.max_steps_per_episode:
-                max_steps_penalty = -10.0
-                reward += max_steps_penalty
-                reward_breakdown['超过最大步数'] = max_steps_penalty
-                info['failed'] = True
-                info['success'] = False
-                info['out_of_bounds'] = False
-                info['max_steps_exceeded'] = True
-                
-                # 立即标记为 Done
-                info['reward_breakdown'] = reward_breakdown
-                info['total_reward'] = reward
-                rewards[env_idx] = reward
-                infos.append(info)
-                continue
-            
-            # 4. 检查空推（最低优先级，仅在未出界、未成功、未超时时）
+            # 3. 检查空推（在超时检测之前，确保每步都有空推数据用于日志）
             is_empty, empty_value, empty_total, empty_ratio, empty_threshold = self._check_empty_push(env_idx)
             info['empty_push'] = is_empty
             info['empty_metrics'] = {
@@ -751,6 +722,16 @@ class PushEnv:
                 empty_penalty = -5.0
                 reward += empty_penalty
                 reward_breakdown['空推惩罚'] = empty_penalty
+            
+            # 4. 检查是否超过最大步数（仅在未出界且未成功时）
+            if current_step >= self.max_steps_per_episode:
+                max_steps_penalty = -10.0
+                reward += max_steps_penalty
+                reward_breakdown['超过最大步数'] = max_steps_penalty
+                info['failed'] = True
+                info['success'] = False
+                info['out_of_bounds'] = False
+                info['max_steps_exceeded'] = True
             
             # 保存奖励信息
             info['reward_breakdown'] = reward_breakdown
@@ -781,108 +762,174 @@ class PushEnv:
                 # depth_320 已经是 (320, 320) 的 numpy 数组
                 self.previous_depth_imgs[env_idx] = depth_320.copy()
     
-    def _check_successful_separation(self, env_idx, spawned_objects):
+    def _get_object_ids_in_env(self, env_idx, seg_img, spawned_objects):
         """
-        [功能]: 检查目标物体是否成功分离
-        [逻辑]: 1. 获取目标物体掩膜 2. 向外膨肀3cm 3. 检查膨胀区域内是否只有目标掩膜
-        [输入]: env_idx (int), spawned_objects (list)
-        [输出]: bool
+        [功能]: 识别当前环境下所有生成物体的 seg ID（排除桌面和背景）
+        [输入]: env_idx (int), seg_img (np.ndarray), spawned_objects (list)
+        [输出]: (all_object_ids: set, target_id: int or None)
+        """
+        import numpy as np
+        state = self.scene.states[env_idx]
+        all_object_ids = set()
+        target_id = None
+
+        for obj in spawned_objects:
+            if self.scene._get_env_id_from_prim_path(obj.cfg.prim_path) != env_idx:
+                continue
+            pos_3d = obj.data.root_pos_w[0].cpu().numpy()
+            u, v = state.world_to_pixel([pos_3d[0], pos_3d[1]])
+            h, w = seg_img.shape
+            u_c = np.clip(u, 0, w - 1)
+            v_c = np.clip(v, 0, h - 1)
+            oid = seg_img[v_c, u_c]
+            if oid != 0:
+                all_object_ids.add(oid)
+                if "Target_" in obj.cfg.prim_path.split("/")[-1]:
+                    target_id = oid
+
+        return all_object_ids, target_id
+
+    def _build_obstacle_mask(self, seg_img, obstacle_ids):
+        """
+        [功能]: 创建障碍物掩膜（仅包含指定 ID 的像素）
+        [输入]: seg_img (np.ndarray), obstacle_ids (set/list)
+        [输出]: np.ndarray (H, W) uint8, 障碍物像素=255，其余=0
+        """
+        import numpy as np
+        return np.isin(seg_img, list(obstacle_ids)).astype(np.uint8) * 255
+
+    def _check_successful_separation(self, env_idx, spawned_objects,
+                                      expand_meters=0.01, noise_threshold=10):
+        """
+        [功能]: 检查目标物体是否成功分离（矩形包围盒 + 对角线区域检测）
+
+        [算法]:
+          1. 获取目标物体掩膜，计算最小矩形包围盒
+          2. 向外扩张 expand_meters (3cm) 得到扩展矩形区域
+          3. 以包围盒中心为原点，按矩形对角线划分上、下、左、右 4 个三角形区域
+          4. 创建障碍物掩膜（所有物体 - 目标物体）
+          5. 根据包围盒长宽比决定必须清空的区域：
+             - W >= H（扁宽或正方形）→ 上、下必须清空
+             - H > W（竖高）→ 左、右必须清空
+          6. 必须清空的两个区域内障碍物像素均 < noise_threshold → 成功
+
+        [对角线划分] (矩形，非正方形时对角线斜率 ≠ 45°):
+          对于像素相对中心偏移 (dx, dy)，半宽 hw、半高 hh：
+            |dy| * hw > |dx| * hh → 上/下区域
+            |dx| * hh >= |dy| * hw → 左/右区域
+
+        [输入]:
+          env_idx (int): 环境索引
+          spawned_objects (list): 场景物体列表
+          expand_meters (float): 包围盒向外扩张距离（米），默认 0.03 (3cm)
+          noise_threshold (int): 噪声容忍像素数，默认 10
+
+        [输出]: (success: bool, max_required_obstacle: int, detail_str: str)
+          - success: 是否分离成功
+          - max_required_obstacle: 必须清空区域中较大的障碍物像素数
+          - detail_str: 详细描述字符串
         """
         import cv2
         import numpy as np
-        
-        # print(f"[DEBUG] _check_successful_separation called for env {env_idx}")
-        
-        state = self.scene.states[env_idx]
-        
-        # 使用State.get_img()获取处理后的图像（包含分割图）
-        result = state.get_img(hide_robot=True)
-        
-        if result is None:
-            # print(f"[DEBUG] state.get_img()返回None")
-            return False, 0.0, 0.95
-        
-        # get_img返回 (rgb, depth, seg) tuple
-        rgb_img, depth_img, seg_img = result
-        
-        if seg_img is None:
-            # print(f"[DEBUG] 分割图为None")
-            return False, 0.0, 0.95
-        
-        # print(f"[DEBUG] seg_img - dtype: {seg_img.dtype}, shape: {seg_img.shape}, min: {seg_img.min()}, max: {seg_img.max()}")
-        
-        # 找到目标物体的ID和掩膜
-        target_mask = state.extract_target_mask(seg_img, spawned_objects)
-        if target_mask is None:
-            # print(f"[DEBUG] 无法提取目标掩膜 - target_mask is None")
-            return False, 0.0, 0.95
-        
-        # print(f"[DEBUG] target_mask - dtype: {target_mask.dtype}, shape: {target_mask.shape}, min: {target_mask.min()}, max: {target_mask.max()}")
-        
-        # 检查target_mask是否为空（全0）
-        target_pixels_count = np.sum(target_mask > 0)
-        if target_pixels_count == 0:
-            # print(f"[DEBUG] 目标掩膜为空 - 没有目标像素")
-            return False, 0.0, 0.95
-        
-        # print(f"[DEBUG] 目标掩膜像素数: {target_pixels_count}")
-        
-        # 计算像素膨胀距离：3cm → 像素
-        # 工作空间: 0.75m → 320 pixels
-        pixels_per_meter = 320 / 0.75
-        dilation_pixels = int(0.03 * pixels_per_meter)  # 5cm ≈ 21 pixels
-        
-        # 膨胀掩膜得到边界
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation_pixels*2+1, dilation_pixels*2+1))
-        dilated_target_mask = cv2.dilate(target_mask, kernel)
-        
-        # 1. 识别当前环境下所有生成物体的 ID (排除桌面和背景)
-        current_env_object_ids = set()
-        target_id = None
-        for obj in spawned_objects:
-            if self.scene._get_env_id_from_prim_path(obj.cfg.prim_path) == env_idx:
-                pos_3d = obj.data.root_pos_w[0].cpu().numpy()
-                u, v = state.world_to_pixel([pos_3d[0], pos_3d[1]])
-                # 采样中心点 ID
-                h, w = seg_img.shape
-                u_c = np.clip(u, 0, w - 1)
-                v_c = np.clip(v, 0, h - 1)
-                oid = seg_img[v_c, u_c]
-                if oid != 0:
-                    current_env_object_ids.add(oid)
-                    # 识别目标物体的 ID
-                    if "Target_" in obj.cfg.prim_path.split("/")[-1]:
-                        target_id = oid
-        
-        if not current_env_object_ids:
-            # print(f"[DEBUG] 未能在环境中找到任何物体 ID")
-            return False
 
-        # 2. 将边界外的全局掩膜置0
-        masked_seg = seg_img.copy()
-        masked_seg[dilated_target_mask == 0] = 0
-        
-        # 3. 创建边界内属于生成物体的掩膜
-        # np.isin 检查像素值是否在生成的物体 ID 列表中，从而排除桌面 (Table) 等环境 ID
-        all_objects_in_boundary = np.isin(masked_seg, list(current_env_object_ids)).astype(np.uint8)
-        
-        # 4. 比较相似度：IoU (交并比)
-        # 将边界内所有物体的掩膜与目标掩膜对比
-        intersection = np.logical_and(all_objects_in_boundary, target_mask).sum()
-        union = np.logical_or(all_objects_in_boundary, target_mask).sum()
-        
-        if union == 0:
-            # print(f"[DEBUG] Union为0 - 无法计算相似度")
-            return False
-        
-        similarity = intersection / union
-        threshold = 0.95  # 相似度阈值
-        
-        success = similarity > threshold
-        
-        return success, similarity, threshold
+        state = self.scene.states[env_idx]
+
+        # --- 1. 获取分割图 ---
+        result = state.get_img(hide_robot=True)
+        if result is None:
+            return False, 0, "无图像"
+
+        rgb_img, depth_img, seg_img = result
+        if seg_img is None:
+            return False, 0, "无分割图"
+
+        # --- 2. 获取目标物体掩膜和包围盒 ---
+        target_mask = state.extract_target_mask(seg_img, spawned_objects)
+        if target_mask is None or np.sum(target_mask > 0) == 0:
+            return False, 0, "无目标掩膜"
+
+        # 计算掩膜的最小矩形包围盒
+        bx, by, bw, bh = cv2.boundingRect(target_mask)
+
+        # 向外扩张
+        h, w = seg_img.shape
+        pixels_per_meter = 320 / 0.75
+        expand_px = int(expand_meters * pixels_per_meter)  # 3cm ≈ 13 pixels
+
+        # 扩展后的矩形范围（裁剪到图像边界）
+        ex = max(bx - expand_px, 0)
+        ey = max(by - expand_px, 0)
+        ex2 = min(bx + bw + expand_px, w)
+        ey2 = min(by + bh + expand_px, h)
+
+        # 扩展包围盒的中心和半宽半高
+        cx = (ex + ex2) / 2.0
+        cy = (ey + ey2) / 2.0
+        hw = (ex2 - ex) / 2.0  # 半宽
+        hh = (ey2 - ey) / 2.0  # 半高
+
+        if hw < 1 or hh < 1:
+            return False, 0, "包围盒过小"
+
+        # --- 3. 识别物体 ID，创建障碍物掩膜 ---
+        all_object_ids, target_id = self._get_object_ids_in_env(env_idx, seg_img, spawned_objects)
+        if not all_object_ids or target_id is None:
+            return False, 0, "无物体ID"
+
+        obstacle_ids = all_object_ids - {target_id}
+        obstacle_mask = self._build_obstacle_mask(seg_img, obstacle_ids)
+
+        # --- 4. 按矩形对角线划分四区域 ---
+        yy, xx = np.mgrid[0:h, 0:w]
+        dx = xx - cx
+        dy = yy - cy
+
+        # 矩形范围掩膜
+        in_rect = (xx >= ex) & (xx < ex2) & (yy >= ey) & (yy < ey2)
+
+        # 对角线划分：|dy| * hw vs |dx| * hh
+        # 这会根据矩形的实际长宽比自适应调整区域大小
+        cross_top_bottom = np.abs(dy) * hw  # 上下方向的权重
+        cross_left_right = np.abs(dx) * hh  # 左右方向的权重
+
+        region_masks = {
+            '上': in_rect & (dy < 0) & (cross_top_bottom > cross_left_right),
+            '下': in_rect & (dy > 0) & (cross_top_bottom > cross_left_right),
+            '左': in_rect & (dx < 0) & (cross_left_right >= cross_top_bottom),
+            '右': in_rect & (dx > 0) & (cross_left_right >= cross_top_bottom),
+        }
+
+        # --- 5. 统计每个区域的障碍物像素数 ---
+        region_obstacle_counts = {}
+        for name, region_mask in region_masks.items():
+            region_obstacle_counts[name] = int(np.sum((obstacle_mask > 0) & region_mask))
+
+        # --- 6. 根据长宽比判定必须清空的区域 ---
+        rect_w = ex2 - ex
+        rect_h = ey2 - ey
+
+        if rect_w >= rect_h:
+            # 扁宽或正方形：长边是上下（水平边），上下必须清空
+            required_clear = ['上', '下']
+        else:
+            # 竖高：长边是左右（垂直边），左右必须清空
+            required_clear = ['左', '右']
+
+        # 判断必须清空的区域是否都满足条件
+        all_clear = all(region_obstacle_counts[r] < noise_threshold for r in required_clear)
+
+        # 构建详细描述
+        max_required = max(region_obstacle_counts[r] for r in required_clear)
+        clear_names = [r for r in required_clear if region_obstacle_counts[r] < noise_threshold]
+        detail_parts = [f"{r}={region_obstacle_counts[r]}" for r in ['上', '下', '左', '右']]
+        detail_str = (f"盒:{rect_w}×{rect_h} "
+                      f"查:{''.join(required_clear)} "
+                      f"清:{len(clear_names)}/{len(required_clear)} "
+                      f"[{','.join(detail_parts)}]")
+
+        return all_clear, max_required, detail_str
     
-    def _check_empty_push(self, env_idx, change_threshold=512):
+    def _check_empty_push(self, env_idx, change_threshold=128):
         """
         [功能]: 检查是否为空推（推动前后深度图变化像素数 < 阈值）
         [输入]: env_idx (int), change_threshold (int): 变化像素数阈值，默认100

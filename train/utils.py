@@ -135,7 +135,8 @@ def print_training_log(mode, **kwargs):
                 # 成功
                 success = env_info.get('success', False)
                 sep = env_info.get('separation_metrics', {})
-                print(f"  成功判定: {'✓ 成功' if success else '× 未成功'} (相似度: {sep.get('similarity', 0.0):.2%}, 阈值: {sep.get('threshold', 0.98)})")
+                detail_str = sep.get('threshold', '')  # detail_str stored in 'threshold' field
+                print(f"  成功判定: {'✓ 成功' if success else '× 未成功'} ({detail_str})")
                 
                 # 空推
                 is_empty = env_info.get('empty_push', False)
