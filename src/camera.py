@@ -42,8 +42,8 @@ class Camera:
             spawn=sim_utils.PinholeCameraCfg(
                 focal_length=18.14756, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.1, 1.0e5)
             ),
-            # Position: 0.75, 0, 1. Orientation: 180, 0, -90
-            offset=CameraCfg.OffsetCfg(pos=(0.75, 0.0, 1.0), rot=rotation_quat.tolist()),
+            # Position: 0.75, 0, 1.25. Orientation: 180, 0, -90
+            offset=CameraCfg.OffsetCfg(pos=(0.75, 0.0, 1.25), rot=rotation_quat.tolist()),
         )
         self.exclude_prim_paths = exclude_prim_paths
         self.camera = None  # Will be created in initialize()

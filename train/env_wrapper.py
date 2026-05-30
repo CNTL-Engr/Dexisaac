@@ -49,6 +49,7 @@ class PushEnv:
         
         # 空推检测
         self.previous_depth_imgs = {}
+        self.previous_actions = [None for _ in range(self.num_envs)]
         self.num_objects_min = args.num_objects_min
         self.num_objects_max = args.num_objects_max
         # IK失败黑名单：记录失败环境，强制清零或制
@@ -91,6 +92,7 @@ class PushEnv:
         self.current_step = 0
         self.env_dones.fill_(False)
         self.env_steps.fill_(0)
+        self.previous_actions = [None for _ in range(self.num_envs)]
         
         # 清空IK失败黑名单
         self.ik_failed_blacklist.clear()
@@ -148,13 +150,13 @@ class PushEnv:
         self._enforce_blacklist_zero_control()
         
         # **重要：额外执行几步物理模拟，让物体稳定并更新位置**
-        for _ in range(10):  # 执行10步物理模拟，约0.1秒
+        for _ in range(15):  # 执行15步物理模拟，约0.15秒
             self.scene.step()
         # 更新所有物体的数据
         for obj in spawned_objects:
             obj.update(dt=0.01)
         
-        # [新增] 崩飞检测：检查每个环境的物体是否飞出工作空间范围外
+        # 崩飞检测：检查每个环境的物体是否飞出工作空间范围外
         exploded_envs = self._check_exploded_objects(spawned_objects)
         for env_idx in exploded_envs:
             if not self.env_dones[env_idx]:
@@ -170,7 +172,10 @@ class PushEnv:
         # 将崩飞信息添加到infos中
         for env_idx in exploded_envs:
             infos[env_idx]['is_exploded'] = True
-            infos[env_idx]['failed'] = True
+            infos[env_idx]['success'] = False
+            infos[env_idx]['failed'] = False
+            infos[env_idx]['out_of_bounds'] = False
+            infos[env_idx]['out_reason'] = '物体崩飞'
         
         # [FailSafe] 检查 IK 失败状态
         # 如果机器人报告有 IK 失败，这些环境也视为 Done (并且由于惩罚已经给在 _compute_rewards 中)
@@ -613,20 +618,19 @@ class PushEnv:
         [输出]: (rewards: tensor, infos: list) - infos包含奖励组成详情
         
         优先级顺序（从高到低）：
-        1. 出界惩罚（最高优先级）- 出界时不考虑其他奖励
+        1. 出界惩罚（最高优先级）
         2. 成功奖励（次高优先级）- 成功时不检测空推
-        3. 空推惩罚（最低优先级）- 仅在未出界且未成功时检测
+        3. 反向动作惩罚 - 仅在未成功时检测
+        4. 空推惩罚（最低优先级）- 仅在未出界且未成功时检测
         """
         rewards = torch.zeros(self.num_envs, device=self.device)
         infos = []
         
         for env_idx in range(self.num_envs):
-            # [修复] 已完成的环境不计算奖励
+            # 已完成环境跳过奖励和检测
             if self.env_dones[env_idx]:
-                # 环境已完成，奖励为0，不再变化
                 infos.append({
                     'out_of_bounds': False,
-                    'success': True,  # 标记为成功以避免重复检测
                     'failed': False,
                     'empty_push': False,
                     'reward_breakdown': {},
@@ -639,6 +643,7 @@ class PushEnv:
             reward = 0.0
             reward_breakdown = {}  # 奖励组成
             info = {}
+            info['opposite_action'] = False
             
             # 0. 步数惩罚（固定-1）
             current_step = self.env_steps[env_idx].item()
@@ -671,11 +676,30 @@ class PushEnv:
             info['out_reason'] = out_reason
             info['is_exploded'] = is_exploded  # [新增] 崩飞标记（物体飞出边界20cm以外）
             
+            if is_out and is_exploded:
+                # 崩飞视为仿真异常：触发外层重试，不给奖励/惩罚，也不计为普通出界
+                reward = 0.0
+                reward_breakdown = {}
+                info['out_of_bounds'] = False
+                info['failed'] = False
+                info['success'] = False
+                info['empty_push'] = False
+                info['reward_breakdown'] = reward_breakdown
+                info['total_reward'] = reward
+                rewards[env_idx] = reward
+                infos.append(info)
+                continue
+            
             if is_out:
                 # 出界惩罚 - 最高优先级，跳过其他检测
                 out_penalty = -10.0
                 reward += out_penalty
                 reward_breakdown['出界惩罚'] = out_penalty
+                if self._is_opposite_repeat_action(env_idx, actions[env_idx]):
+                    opposite_penalty = -3.0
+                    reward += opposite_penalty
+                    reward_breakdown['反向动作惩罚'] = opposite_penalty
+                    info['opposite_action'] = True
                 info['failed'] = True
                 info['success'] = False
                 info['empty_push'] = False  # 出界时不检测空推
@@ -685,6 +709,7 @@ class PushEnv:
                 info['total_reward'] = reward
                 rewards[env_idx] = reward
                 infos.append(info)
+                self.previous_actions[env_idx] = actions[env_idx]
                 continue  # 跳过后续检测
             
             # 2. 检查成功（次高优先级）
@@ -705,9 +730,17 @@ class PushEnv:
                 info['total_reward'] = reward
                 rewards[env_idx] = reward
                 infos.append(info)
+                self.previous_actions[env_idx] = actions[env_idx]
                 continue  # 跳过空推检测
             
-            # 3. 检查空推（在超时检测之前，确保每步都有空推数据用于日志）
+            # 3. 检查是否与上一步反方向推动（仅在未成功时惩罚）
+            if self._is_opposite_repeat_action(env_idx, actions[env_idx]):
+                opposite_penalty = -3.0
+                reward += opposite_penalty
+                reward_breakdown['反向动作惩罚'] = opposite_penalty
+                info['opposite_action'] = True
+            
+            # 4. 检查空推（在超时检测之前，确保每步都有空推数据用于日志）
             is_empty, empty_value, empty_total, empty_ratio, empty_threshold = self._check_empty_push(env_idx)
             info['empty_push'] = is_empty
             info['empty_metrics'] = {
@@ -723,7 +756,7 @@ class PushEnv:
                 reward += empty_penalty
                 reward_breakdown['空推惩罚'] = empty_penalty
             
-            # 4. 检查是否超过最大步数（仅在未出界且未成功时）
+            # 5. 检查是否超过最大步数（仅在未出界且未成功时）
             if current_step >= self.max_steps_per_episode:
                 max_steps_penalty = -10.0
                 reward += max_steps_penalty
@@ -738,12 +771,29 @@ class PushEnv:
             info['total_reward'] = reward
             rewards[env_idx] = reward
             infos.append(info)
+            self.previous_actions[env_idx] = actions[env_idx]
         
         # [新增] 奖励归一化：降低Q值和Target方差，提高训练稳定性
         # 将奖励范围从[-10, 10]缩放到[-1, 1]
         rewards = rewards  / 10 
         
         return rewards, infos
+    
+    def _is_opposite_repeat_action(self, env_idx, current_action):
+        """
+        检查当前动作是否与上一步为反方向动作。
+        动作0-3为推目标，4-7为推障碍；方向索引均为 action % 4。
+        """
+        previous_action = self.previous_actions[env_idx]
+        if previous_action is None:
+            return False
+        
+        previous_action = int(previous_action)
+        current_action = int(current_action)
+        
+        opposite_direction = (previous_action % 4 - current_action % 4) % 4 == 2
+        
+        return opposite_direction
     
     def _save_previous_masks(self, spawned_objects):
         """
@@ -799,31 +849,31 @@ class PushEnv:
         return np.isin(seg_img, list(obstacle_ids)).astype(np.uint8) * 255
 
     def _check_successful_separation(self, env_idx, spawned_objects,
-                                      expand_meters=0.01, noise_threshold=10):
+                                      expand_meters=0.02, noise_threshold=15):
         """
-        [功能]: 检查目标物体是否成功分离（矩形包围盒 + 对角线区域检测）
+        [功能]: 检查目标物体是否成功分离（最小旋转矩形包围盒 + 对角线区域检测）
 
         [算法]:
-          1. 获取目标物体掩膜，计算最小矩形包围盒
-          2. 向外扩张 expand_meters (3cm) 得到扩展矩形区域
-          3. 以包围盒中心为原点，按矩形对角线划分上、下、左、右 4 个三角形区域
+          1. 获取目标物体掩膜，计算最小旋转矩形包围盒
+          2. 在旋转矩形局部坐标中向外扩张 expand_meters (2cm)
+          3. 以旋转矩形中心为原点，按局部矩形对角线划分上、下、左、右 4 个三角形区域
           4. 创建障碍物掩膜（所有物体 - 目标物体）
-          5. 根据包围盒长宽比决定必须清空的区域：
-             - W >= H（扁宽或正方形）→ 上、下必须清空
-             - H > W（竖高）→ 左、右必须清空
+          5. 根据旋转矩形局部长宽比决定必须清空的区域：
+             - W >= H（局部长边横向）→ 局部上、下必须清空
+             - H > W（局部长边纵向）→ 局部左、右必须清空
           6. 必须清空的两个区域内障碍物像素均 < noise_threshold → 成功
 
-        [对角线划分] (矩形，非正方形时对角线斜率 ≠ 45°):
-          对于像素相对中心偏移 (dx, dy)，半宽 hw、半高 hh：
-            |dy| * hw > |dx| * hh → 上/下区域
-            |dx| * hh >= |dy| * hw → 左/右区域
+        [对角线划分] (旋转矩形局部坐标，非正方形时对角线斜率 ≠ 45°):
+          对于像素相对中心的局部偏移 (local_x, local_y)，半宽 hw、半高 hh：
+            |local_y| * hw > |local_x| * hh → 上/下区域
+            |local_x| * hh >= |local_y| * hw → 左/右区域
 
         [输入]:
           env_idx (int): 环境索引
           spawned_objects (list): 场景物体列表
-          expand_meters (float): 包围盒向外扩张距离（米），默认 0.03 (3cm)
-          noise_threshold (int): 噪声容忍像素数，默认 10
-
+          expand_meters (float): 包围盒向外扩张距离（米），默认 0.02 (2cm)
+          noise_threshold (int): 噪声容忍像素数，默认 15
+    
         [输出]: (success: bool, max_required_obstacle: int, detail_str: str)
           - success: 是否分离成功
           - max_required_obstacle: 必须清空区域中较大的障碍物像素数
@@ -843,33 +893,37 @@ class PushEnv:
         if seg_img is None:
             return False, 0, "无分割图"
 
-        # --- 2. 获取目标物体掩膜和包围盒 ---
+        # --- 2. 获取目标物体掩膜和最小旋转包围盒 ---
         target_mask = state.extract_target_mask(seg_img, spawned_objects)
         if target_mask is None or np.sum(target_mask > 0) == 0:
             return False, 0, "无目标掩膜"
 
-        # 计算掩膜的最小矩形包围盒
-        bx, by, bw, bh = cv2.boundingRect(target_mask)
+        target_points = cv2.findNonZero(target_mask)
+        if target_points is None or len(target_points) < 3:
+            return False, 0, "目标掩膜过小"
+
+        rot_rect = cv2.minAreaRect(target_points)
+        box_points = cv2.boxPoints(rot_rect).astype(np.float32)
+
+        # 由旋转矩形相邻边建立局部坐标轴
+        edge_x = box_points[1] - box_points[0]
+        edge_y = box_points[2] - box_points[1]
+        rect_w = float(np.linalg.norm(edge_x))
+        rect_h = float(np.linalg.norm(edge_y))
+
+        if rect_w < 1 or rect_h < 1:
+            return False, 0, "包围盒过小"
+
+        x_axis = edge_x / rect_w
+        y_axis = edge_y / rect_h
+        cx, cy = rot_rect[0]
 
         # 向外扩张
         h, w = seg_img.shape
-        pixels_per_meter = 320 / 0.75
-        expand_px = int(expand_meters * pixels_per_meter)  # 3cm ≈ 13 pixels
-
-        # 扩展后的矩形范围（裁剪到图像边界）
-        ex = max(bx - expand_px, 0)
-        ey = max(by - expand_px, 0)
-        ex2 = min(bx + bw + expand_px, w)
-        ey2 = min(by + bh + expand_px, h)
-
-        # 扩展包围盒的中心和半宽半高
-        cx = (ex + ex2) / 2.0
-        cy = (ey + ey2) / 2.0
-        hw = (ex2 - ex) / 2.0  # 半宽
-        hh = (ey2 - ey) / 2.0  # 半高
-
-        if hw < 1 or hh < 1:
-            return False, 0, "包围盒过小"
+        pixels_per_meter = 320 / 1.0
+        expand_px = int(expand_meters * pixels_per_meter)  # 1cm ≈ 3 pixels
+        hw = rect_w / 2.0 + expand_px  # 扩展后的局部半宽
+        hh = rect_h / 2.0 + expand_px  # 扩展后的局部半高
 
         # --- 3. 识别物体 ID，创建障碍物掩膜 ---
         all_object_ids, target_id = self._get_object_ids_in_env(env_idx, seg_img, spawned_objects)
@@ -879,24 +933,26 @@ class PushEnv:
         obstacle_ids = all_object_ids - {target_id}
         obstacle_mask = self._build_obstacle_mask(seg_img, obstacle_ids)
 
-        # --- 4. 按矩形对角线划分四区域 ---
+        # --- 4. 按旋转矩形局部对角线划分四区域 ---
         yy, xx = np.mgrid[0:h, 0:w]
         dx = xx - cx
         dy = yy - cy
+        local_x = dx * x_axis[0] + dy * x_axis[1]
+        local_y = dx * y_axis[0] + dy * y_axis[1]
 
-        # 矩形范围掩膜
-        in_rect = (xx >= ex) & (xx < ex2) & (yy >= ey) & (yy < ey2)
+        # 旋转矩形扩展范围掩膜
+        in_rect = (np.abs(local_x) <= hw) & (np.abs(local_y) <= hh)
 
-        # 对角线划分：|dy| * hw vs |dx| * hh
-        # 这会根据矩形的实际长宽比自适应调整区域大小
-        cross_top_bottom = np.abs(dy) * hw  # 上下方向的权重
-        cross_left_right = np.abs(dx) * hh  # 左右方向的权重
+        # 对角线划分：|local_y| * hw vs |local_x| * hh
+        # 这会根据旋转矩形的实际长宽比自适应调整区域大小
+        cross_top_bottom = np.abs(local_y) * hw  # 局部上下方向的权重
+        cross_left_right = np.abs(local_x) * hh  # 局部左右方向的权重
 
         region_masks = {
-            '上': in_rect & (dy < 0) & (cross_top_bottom > cross_left_right),
-            '下': in_rect & (dy > 0) & (cross_top_bottom > cross_left_right),
-            '左': in_rect & (dx < 0) & (cross_left_right >= cross_top_bottom),
-            '右': in_rect & (dx > 0) & (cross_left_right >= cross_top_bottom),
+            '上': in_rect & (local_y < 0) & (cross_top_bottom > cross_left_right),
+            '下': in_rect & (local_y > 0) & (cross_top_bottom > cross_left_right),
+            '左': in_rect & (local_x < 0) & (cross_left_right >= cross_top_bottom),
+            '右': in_rect & (local_x > 0) & (cross_left_right >= cross_top_bottom),
         }
 
         # --- 5. 统计每个区域的障碍物像素数 ---
@@ -904,15 +960,12 @@ class PushEnv:
         for name, region_mask in region_masks.items():
             region_obstacle_counts[name] = int(np.sum((obstacle_mask > 0) & region_mask))
 
-        # --- 6. 根据长宽比判定必须清空的区域 ---
-        rect_w = ex2 - ex
-        rect_h = ey2 - ey
-
+        # --- 6. 根据旋转矩形局部长宽比判定必须清空的区域 ---
         if rect_w >= rect_h:
-            # 扁宽或正方形：长边是上下（水平边），上下必须清空
+            # 局部宽边更长：要求宽边两侧（局部上/下）清空
             required_clear = ['上', '下']
         else:
-            # 竖高：长边是左右（垂直边），左右必须清空
+            # 局部高边更长：要求高边两侧（局部左/右）清空
             required_clear = ['左', '右']
 
         # 判断必须清空的区域是否都满足条件
@@ -922,14 +975,16 @@ class PushEnv:
         max_required = max(region_obstacle_counts[r] for r in required_clear)
         clear_names = [r for r in required_clear if region_obstacle_counts[r] < noise_threshold]
         detail_parts = [f"{r}={region_obstacle_counts[r]}" for r in ['上', '下', '左', '右']]
-        detail_str = (f"盒:{rect_w}×{rect_h} "
+        rect_angle = float(np.degrees(np.arctan2(x_axis[1], x_axis[0])))
+        detail_str = (f"旋转盒:{int(round(rect_w))}×{int(round(rect_h))} "
+                      f"角:{rect_angle:.1f} "
                       f"查:{''.join(required_clear)} "
                       f"清:{len(clear_names)}/{len(required_clear)} "
                       f"[{','.join(detail_parts)}]")
 
         return all_clear, max_required, detail_str
     
-    def _check_empty_push(self, env_idx, change_threshold=128):
+    def _check_empty_push(self, env_idx, change_threshold=100):
         """
         [功能]: 检查是否为空推（推动前后深度图变化像素数 < 阈值）
         [输入]: env_idx (int), change_threshold (int): 变化像素数阈值，默认100
@@ -999,12 +1054,12 @@ class PushEnv:
         import math
         
         exploded_envs = []
-        explode_threshold = 0.20  # 20cm阈值
+        explode_threshold = 0.18  # 18cm阈值
         
         # 工作空间限制
         workspace_limits = torch.tensor([
-            [0.4, -0.35, 0.02],  # min [x, y, z]
-            [1.1, 0.35, 0.4]     # max [x, y, z]
+            [0.25, -0.50, 0.02],  # min [x, y, z]
+            [1.25, 0.50, 0.4]     # max [x, y, z]
         ], device=self.device)
         
         # 计算每个环境的偏移量
@@ -1078,8 +1133,8 @@ class PushEnv:
         
         # 工作空间限制（与scene.py保持一致）
         workspace_limits = torch.tensor([
-            [0.4, -0.35, 0.02],  # min [x, y, z]
-            [1.1, 0.35, 0.4]     # max [x, y, z]
+            [0.25, -0.50, 0.02],  # min [x, y, z]
+            [1.25, 0.50, 0.4]     # max [x, y, z]
         ], device=self.device)
         
         # 计算环境偏移量
@@ -1096,7 +1151,7 @@ class PushEnv:
         # print(f'\n[出界检测调试] Env {env_idx}:')
         # print(f'  工作空间限制: X[{workspace_limits[0,0]:.2f}, {workspace_limits[1,0]:.2f}], Y[{workspace_limits[0,1]:.2f}, {workspace_limits[1,1]:.2f}], Z>={workspace_limits[0,2]:.2f}')
         
-        # **重要：先更新所有物体的数据，获取最新位置**
+        # **先更新所有物体的数据，获取最新位置**
         for obj in spawned_objects:
             obj.update(dt=0.01)  # 从物理引擎同步最新状态，使用正确的dt
         
@@ -1131,7 +1186,7 @@ class PushEnv:
                 # print(f'  {status} {obj_name}: 本地坐标({local_x:.3f}, {local_y:.3f}, {local_z:.3f}) | X:{x_in} Y:{y_in} Z:{z_in}')
             
             # 检查XY是否在工作空间内，并计算超出距离
-            explode_threshold = 0.20  # 20cm阈值，超过则认为是崩飞
+            explode_threshold = 0.18  # 18cm阈值，超过则认为是崩飞
             
             if not x_in:
                 # 计算超出边界的距离
@@ -1159,7 +1214,7 @@ class PushEnv:
         
         out_reason = check_info.get("reason", "unknown") if out_of_bounds else "none"
         
-        # 掩膜检测的出界不算崩飞（是正常推动导致的）
+        # 掩膜检测的出界是正常推动导致的
         return out_of_bounds, out_reason, False
     
     def _check_collision(self, env_idx):
@@ -1197,8 +1252,15 @@ class PushEnv:
             # 提前结束条件：
             # 1. 成功分离
             # 2. 出界（失败）
-            # 3. 达到最大步数
-            if info.get('success', False) or info.get('out_of_bounds', False) or info.get('failed', False) or self.current_step >= self.max_steps_per_episode:
+            # 3. 崩飞异常（外层重试，不计普通失败）
+            # 4. 达到最大步数
+            if (
+                info.get('success', False)
+                or info.get('out_of_bounds', False)
+                or info.get('failed', False)
+                or info.get('is_exploded', False)
+                or self.current_step >= self.max_steps_per_episode
+            ):
                 dones[env_idx] = True
         
         return dones

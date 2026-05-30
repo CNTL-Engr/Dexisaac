@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import copy
+from contextlib import contextmanager
 from collections import deque
 import os
 import sys
@@ -34,6 +35,7 @@ if src_path not in sys.path:
 
 from pushnet import EquivariantPushNet
 from pushnet_cnn import CNNPushNet
+from escnn import nn as enn
 
 
 class ObstacleCountTaskGenerator:
@@ -61,38 +63,38 @@ class ObstacleCountTaskGenerator:
     NUM_TASKS = 4  # 固定 4 种子任务（Task 0-3）
 
     # 障碍物数量基数：Task 0 对应 4 个障碍物
-    BASE_OBSTACLE_COUNT = 4
+    BASE_OBSTACLE_COUNT = 8
 
     # 各 Task 的名称（用于打印/日志）
     TASK_NAMES = {
-        0: "4 Obstacles",
-        1: "5 Obstacles",
-        2: "6 Obstacles",
-        3: "7 Obstacles",
+        0: "8 Obstacles",
+        1: "9 Obstacles",
+        2: "10 Obstacles",
+        3: "11 Obstacles",
     }
 
     # 默认模型文件夹路径
-    _DEFAULT_OBSTACLE_DIR = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_CH"
-    _DEFAULT_TARGET_DIR = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_target"
+    _DEFAULT_OBSTACLE_DIR = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata/meshdata_CH"
+    _DEFAULT_TARGET_DIR = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata/meshdata_target"
 
-    def __init__(self, radius=0.21, min_dist=0.06, max_attempts=1000, model_dirs=None):
+    def __init__(self, num_tasks=None, base_obstacle_count=None, radius=0.21, min_dist=0.06, max_attempts=1000, model_dirs=None):
         """
         [参数]:
-          radius       : 障碍物分布的最大半径（以目标物体为圆心）
-          min_dist     : 障碍物中心之间的最小间距（防穿模）
-          max_attempts : 单个障碍物放置时的最大尝试次数
-          model_dirs   : 每个子任务使用的模型文件夹配置 (dict 或 None)
-                         格式: { task_id: { 'obstacle_dir': '路径', 'target_dir': '路径' }, ... }
-                         未指定的 task_id 将使用默认路径。
-                         也可以只指定其中一个 key（obstacle_dir 或 target_dir），另一个使用默认值。
-
-        [示例]:
-          model_dirs = {
-              0: {'obstacle_dir': '/path/to/simple_models',  'target_dir': '/path/to/targets'},
-              1: {'obstacle_dir': '/path/to/medium_models', 'target_dir': '/path/to/targets'},
-              2: {'obstacle_dir': '/path/to/complex_models'},  # target_dir 使用默认
-          }
+          num_tasks          : 子任务数量，默认使用类属性 NUM_TASKS
+          base_obstacle_count: 基础障碍物数量（Task 0 的障碍物数），默认使用类属性 BASE_OBSTACLE_COUNT
+          radius             : 障碍物分布的最大半径（以目标物体为圆心）
+          min_dist           : 障碍物中心之间的最小间距（防穿模）
+          max_attempts       : 单个障碍物放置时的最大尝试次数
+          model_dirs         : 每个子任务使用的模型文件夹配置 (dict 或 None)
         """
+        if num_tasks is not None:
+            self.NUM_TASKS = num_tasks
+        if base_obstacle_count is not None:
+            self.BASE_OBSTACLE_COUNT = base_obstacle_count
+        self.TASK_NAMES = {
+            i: f"{self.BASE_OBSTACLE_COUNT + i} Obstacles" for i in range(self.NUM_TASKS)
+        }
+
         self.radius = radius
         self.min_dist = min_dist
         self.max_attempts = max_attempts
@@ -146,6 +148,33 @@ class ObstacleCountTaskGenerator:
         task_id = random.randint(0, self.NUM_TASKS - 1)
         obstacle_count = self.get_obstacle_count(task_id)
         return task_id, obstacle_count, self.TASK_NAMES[task_id]
+
+    def sample_task_batch(self, batch_size, mode='random', curriculum_level=None):
+        """
+        [功能]: 采样一批 task_id，支持多种采样模式 (标准 MAML 接口)
+        [输入]:
+          batch_size       : 采样数量
+          mode             : 'random' | 'curriculum' | 'curriculum_random' | 'balanced'
+          curriculum_level : 当前课程等级 (仅 curriculum/curriculum_random 模式需要)
+        [输出]: List[int], task_id 列表
+        """
+        if mode == 'random':
+            return [random.randint(0, self.NUM_TASKS - 1) for _ in range(batch_size)]
+        elif mode == 'curriculum':
+            level = max(0, min(curriculum_level or 0, self.NUM_TASKS - 1))
+            return [level] * batch_size
+        elif mode == 'curriculum_random':
+            level = max(0, min(curriculum_level or 0, self.NUM_TASKS - 1))
+            return [random.randint(0, level) for _ in range(batch_size)]
+        elif mode == 'balanced':
+            task_ids = []
+            while len(task_ids) < batch_size:
+                shuffled_ids = list(range(self.NUM_TASKS))
+                random.shuffle(shuffled_ids)
+                task_ids.extend(shuffled_ids)
+            return task_ids[:batch_size]
+        else:
+            raise ValueError(f"Unknown task sampling mode: {mode}")
 
     def get_task_by_id(self, task_id):
         """
@@ -366,22 +395,48 @@ class MAMLDQNAgent:
     """
     [功能]: MAML DQN Agent，支持等变网络，使用 torch.autograd.grad 手动更新 fast_weights。
     """
-    def __init__(self, device='cuda', lr=1e-4, inner_lr=1e-3, gamma=0.99, use_equivariant=True):
+    def __init__(self, device='cuda', lr=1e-4, inner_lr=1e-3, gamma=0.99,
+                 use_equivariant=True, first_order=True, inner_steps=1):
         self.device = device
         self.gamma = gamma
         self.inner_lr = inner_lr
+        self.first_order = first_order
+        self.inner_steps = inner_steps
         self.use_equivariant = use_equivariant
-        
+
         if use_equivariant:
             self.policy_net = EquivariantPushNet().to(device)
         else:
             self.policy_net = CNNPushNet().to(device)
-            
+
         self.target_net = copy.deepcopy(self.policy_net)
         self.target_net.eval()
-        
+
         self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=lr)
-        self.replay_buffer = TaskReplayBuffer(capacity=5000)
+
+    @contextmanager
+    def _dynamic_r2conv_filters_for_eval(self):
+        """
+        Temporarily bypass escnn R2Conv eval-mode filter caches.
+        Only R2Conv modules are toggled; BatchNorm and all other modules keep
+        their original training/eval state.
+        """
+        r2conv_states = []
+        for module in self.policy_net.modules():
+            if isinstance(module, enn.R2Conv) and not module.training:
+                r2conv_states.append((module, module.training))
+                module.train(True)
+        try:
+            yield
+        finally:
+            for module, was_training in r2conv_states:
+                module.train(was_training)
+
+    def _eval_functional_call(self, fast_weights, args):
+        if self.policy_net.training:
+            return functional_call(self.policy_net, fast_weights, args)
+        with self._dynamic_r2conv_filters_for_eval():
+            return functional_call(self.policy_net, fast_weights, args)
         
     def select_action(self, state, epsilon, invalid_actions=None, fast_weights=None):
         """
@@ -402,7 +457,10 @@ class MAMLDQNAgent:
                 # 判断是否使用 task-specific fast weights
                 if fast_weights is not None:
                     # 使用 torch.func 进行无状态前向传播
-                    q_values = functional_call(self.policy_net, fast_weights, (state_float,))
+                    if self.policy_net.training:
+                        q_values = functional_call(self.policy_net, fast_weights, (state_float,))
+                    else:
+                        q_values = self._eval_functional_call(fast_weights, (state_float,))
                 else:
                     q_values = self.policy_net(state_float)
                 
@@ -423,53 +481,73 @@ class MAMLDQNAgent:
                 
         return action_idx, strategy_type
 
-    def adapt(self, support_transitions, inner_steps=1, first_order=False):
+    def adapt(self, support_transitions, inner_steps=None, first_order=None, adapt_batch_size=None):
         """
         [功能]: Inner-loop Adaptation
         [输入]: support_transitions: Support Set 经验
+                inner_steps: 内循环步数 (None 则使用实例默认值)
                 first_order: 如果 True，不计算二阶导数 (FOMAML)
+                adapt_batch_size: 适应阶段微批大小 (None 则保持原全量batch行为)
         [输出]: fast_weights: 字典形式的模型参数
         """
+        if inner_steps is None:
+            inner_steps = self.inner_steps
+        if first_order is None:
+            first_order = self.first_order
         if not support_transitions:
-            # 如果没收集到Support数据，返回初始权重
             return {name: param for name, param in self.policy_net.named_parameters()}
-            
+
         states, actions, rewards, next_states, dones = zip(*support_transitions)
-        
-        states = torch.cat(states).to(self.device).float() / 255.0
-        next_states = torch.cat(next_states).to(self.device).float() / 255.0
+        support_size = len(support_transitions)
+
+        if adapt_batch_size is not None and adapt_batch_size <= 0:
+            adapt_batch_size = None
+
+        if adapt_batch_size is None or adapt_batch_size >= support_size:
+            return self._adapt_full_batch(
+                states, actions, rewards, next_states, dones, inner_steps, first_order
+            )
+
+        return self._adapt_micro_batch(
+            states,
+            actions,
+            rewards,
+            next_states,
+            dones,
+            inner_steps,
+            first_order,
+            adapt_batch_size,
+        )
+
+    def _adapt_full_batch(self, states, actions, rewards, next_states, dones, inner_steps, first_order):
+        states = torch.stack(states).to(self.device).float() / 255.0
         actions = torch.tensor(actions, dtype=torch.long, device=self.device)
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
-        
+
+        # 计算 Target Q (不需要梯度，逐样本处理以节省显存)
+        with torch.no_grad():
+            next_states_t = torch.stack(next_states).to(self.device).float() / 255.0
+            q_next_target = self.target_net(next_states_t)
+            # Double DQN: 用 policy_net 选动作 (此处用初始权重即可)
+            q_next_policy = self.policy_net(next_states_t)
+            next_actions = q_next_policy.max(dim=1)[1]
+            max_q_next = q_next_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
+            targets = rewards + (1 - dones) * self.gamma * max_q_next
+            del next_states_t, q_next_target, q_next_policy, next_actions, max_q_next
+            torch.cuda.empty_cache()
+
         # 初始化 fast_weights 为当前模型的参数
         fast_weights = {name: param for name, param in self.policy_net.named_parameters()}
-        
+
         for _ in range(inner_steps):
-            # 1. 计算 Q(s, a; fast_weights)
             q_pred = functional_call(self.policy_net, fast_weights, (states,))
             q_values = q_pred.gather(1, actions.unsqueeze(1)).squeeze(1)
-            
-            # 2. 计算 Target Q
-            # Target Network 保持冻结 (不进行 Inner Loop 的梯度流追踪，以防不稳定)
-            with torch.no_grad():
-                # Double DQN 机制：用当前的 fast_weights 选择最优动作
-                q_next_policy = functional_call(self.policy_net, fast_weights, (next_states,))
-                next_actions = q_next_policy.max(dim=1)[1]
-                
-                # 用冻结的 Target Net 评估该动作
-                q_next_target = self.target_net(next_states)
-                max_q_next = q_next_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
-                
-                targets = rewards + (1 - dones) * self.gamma * max_q_next
-            
-            # 3. Inner Loss
+
             inner_loss = F.mse_loss(q_values, targets)
-            
-            # 4. 手动求导更新 fast_weights
-            # create_graph=True 开启二阶导数用于 Outer-loop backprop
+
             grads = torch.autograd.grad(inner_loss, fast_weights.values(), create_graph=not first_order, allow_unused=True)
-            
+
             new_fast_weights = {}
             for (name, param), grad in zip(fast_weights.items(), grads):
                 if grad is not None:
@@ -477,14 +555,84 @@ class MAMLDQNAgent:
                 else:
                     new_fast_weights[name] = param
             fast_weights = new_fast_weights
-            
+
         return fast_weights
 
-    def meta_update(self, task_batch, inner_steps=1, first_order=False):
+    def _adapt_micro_batch(self, states, actions, rewards, next_states, dones, inner_steps, first_order, adapt_batch_size):
+        support_size = len(states)
+        actions = torch.tensor(actions, dtype=torch.long, device=self.device)
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
+
+        targets = torch.empty(support_size, dtype=torch.float32, device=self.device)
+
+        with torch.no_grad():
+            for start in range(0, support_size, adapt_batch_size):
+                end = min(start + adapt_batch_size, support_size)
+                next_states_t = torch.stack(next_states[start:end]).to(self.device).float() / 255.0
+                q_next_target = self.target_net(next_states_t)
+                q_next_policy = self.policy_net(next_states_t)
+                next_actions = q_next_policy.max(dim=1)[1]
+                max_q_next = q_next_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
+                targets[start:end] = rewards[start:end] + (1 - dones[start:end]) * self.gamma * max_q_next
+                del next_states_t, q_next_target, q_next_policy, next_actions, max_q_next
+                torch.cuda.empty_cache()
+
+        fast_weights = {name: param for name, param in self.policy_net.named_parameters()}
+
+        for _ in range(inner_steps):
+            fast_items = list(fast_weights.items())
+            fast_params = [param for _, param in fast_items]
+            grad_sums = [None for _ in fast_params]
+
+            for start in range(0, support_size, adapt_batch_size):
+                end = min(start + adapt_batch_size, support_size)
+                states_t = torch.stack(states[start:end]).to(self.device).float() / 255.0
+                q_pred = self._eval_functional_call(fast_weights, (states_t,))
+                q_values = q_pred.gather(1, actions[start:end].unsqueeze(1)).squeeze(1)
+                inner_loss = F.mse_loss(q_values, targets[start:end], reduction="sum") / support_size
+
+                grads = torch.autograd.grad(
+                    inner_loss,
+                    fast_params,
+                    create_graph=not first_order,
+                    allow_unused=True,
+                )
+
+                for idx, grad in enumerate(grads):
+                    if grad is None:
+                        continue
+                    if grad_sums[idx] is None:
+                        grad_sums[idx] = grad
+                    else:
+                        grad_sums[idx] = grad_sums[idx] + grad
+
+                del states_t, q_pred, q_values, inner_loss, grads
+                torch.cuda.empty_cache()
+
+            new_fast_weights = {}
+            for (name, param), grad in zip(fast_items, grad_sums):
+                if grad is not None:
+                    updated = param - self.inner_lr * grad
+                else:
+                    updated = param
+                if first_order:
+                    updated = updated.detach().requires_grad_(True)
+                new_fast_weights[name] = updated
+            fast_weights = new_fast_weights
+
+        return fast_weights
+
+    def meta_update(self, task_batch, inner_steps=None, first_order=None):
         """
         [功能]: Outer-loop Meta Update
         [返回]: meta_loss 的均值
         """
+        if inner_steps is None:
+            inner_steps = self.inner_steps
+        if first_order is None:
+            first_order = self.first_order
+
         if not task_batch:
             return 0.0
             
@@ -501,37 +649,38 @@ class MAMLDQNAgent:
             # --- 2. Outer Loop: 在 Query Set 上评估 ---
             if not query_set:
                 continue
-                
+
             q_states, q_actions, q_rewards, q_next_states, q_dones = zip(*query_set)
-            
-            q_states = torch.cat(q_states).to(self.device).float() / 255.0
-            q_next_states = torch.cat(q_next_states).to(self.device).float() / 255.0
+
             q_actions = torch.tensor(q_actions, dtype=torch.long, device=self.device)
             q_rewards = torch.tensor(q_rewards, dtype=torch.float32, device=self.device)
             q_dones = torch.tensor(q_dones, dtype=torch.float32, device=self.device)
-            
-            # 前向传播使用适应后的 fast_weights
-            q_pred = functional_call(self.policy_net, fast_weights, (q_states,))
-            q_values = q_pred.gather(1, q_actions.unsqueeze(1)).squeeze(1)
-            
+
+            # 先计算 targets (不需要梯度), 然后释放 next_states 显存
             with torch.no_grad():
-                q_next_policy = functional_call(self.policy_net, fast_weights, (q_next_states,))
+                q_next_states_t = torch.stack(q_next_states).to(self.device).float() / 255.0
+                q_next_policy = functional_call(self.policy_net, fast_weights, (q_next_states_t,))
                 next_actions = q_next_policy.max(dim=1)[1]
-                q_next_target = self.target_net(q_next_states)
+                q_next_target = self.target_net(q_next_states_t)
                 max_q_next = q_next_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
                 targets = q_rewards + (1 - q_dones) * self.gamma * max_q_next
-                
+                del q_next_states_t, q_next_policy, next_actions, q_next_target, max_q_next
+                torch.cuda.empty_cache()
+
+            # 前向传播使用适应后的 fast_weights (需要梯度)
+            q_states_t = torch.stack(q_states).to(self.device).float() / 255.0
+            q_pred = functional_call(self.policy_net, fast_weights, (q_states_t,))
+            q_values = q_pred.gather(1, q_actions.unsqueeze(1)).squeeze(1)
+
             task_meta_loss = F.mse_loss(q_values, targets)
-            
-            # [显存优化] 每次 Task 直接计算梯度并累加，释放中间激活张量的显存
+
             task_meta_loss_scaled = task_meta_loss / len(task_batch)
             task_meta_loss_scaled.backward()
-            
+
             meta_loss += task_meta_loss.item()
-            
-            # 释放 Query Set 推理产生的张量
-            del q_states, q_next_states, q_actions, q_rewards, q_dones
-            del q_pred, q_values, q_next_policy, next_actions, q_next_target, max_q_next, targets
+
+            del q_states_t, q_actions, q_rewards, q_dones
+            del q_pred, q_values, targets
             del fast_weights
             torch.cuda.empty_cache()
             

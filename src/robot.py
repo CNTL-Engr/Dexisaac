@@ -123,8 +123,8 @@ class Robot:
         self.fixed_ee_orientation = None
 
         self.workspace_limits = torch.tensor([
-            [0.375, -0.375, 0.02], # Min
-            [1.125, 0.375, 0.4]    # Max
+            [0.25, -0.50, 0.02], # Min
+            [1.25, 0.50, 0.4]    # Max
         ], device=self.device)
         
         self.push_primitive = PushActionPrimitive(device=self.device, lift_height=0.1)
@@ -745,6 +745,5 @@ class Robot:
                 if pos_err < threshold and rot_err < 0.001: 
                      if (stable_steps := stable_steps + 1) > 10 and elapsed_time >= durations.max(): break
                 else: stable_steps = 0
-
 
 

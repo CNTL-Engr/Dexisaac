@@ -104,7 +104,7 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
     center_depth = depth_map[center_v, center_u]
     
     # 像素到米的转换
-    PPM = 320 / 0.75  # pixels per meter
+    PPM = 320 / 1.0  # pixels per meter
     
     if action_idx <= 3:
         # ===== 推目标物体 =====
@@ -190,9 +190,9 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
         eroded_depth = cv2.erode(depth_map, kernel_roi, iterations=1)
         
         # 相机高度
-        CAMERA_Z = 1.0
-        # 安全余量：夹爪下降高度 = 最高点 + 1.5cm
-        SAFETY_MARGIN = 0.015
+        CAMERA_Z = 1.25
+        # 安全余量：夹爪下降高度 = 最高点 + 1cm
+        SAFETY_MARGIN = 0.01
         
         # 在搜索区域内寻找安全推点
         # 策略：找 eroded_depth 最大的点（即夹爪范围内最高点最低的位置）
@@ -264,7 +264,7 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
         else:
             min_depth_roi = center_depth
             
-        CAMERA_Z = 1.0
+        CAMERA_Z = 1.25
         max_height_in_roi = CAMERA_Z - min_depth_roi
         
         # 规则：以目标中心为夹爪范围中心，在该范围内找最高点深度 + 1cm（防止碰撞）
@@ -280,7 +280,7 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
     # u = 160 + int((y_local - 0.0) * PPM)    -> u 对应 World Y
     # v = 160 + int((x_local - 0.75) * PPM)   -> v 对应 World X
     
-    PPM = 320 / 0.75  # pixels per meter
+    PPM = 320 / 1.0  # pixels per meter
     
     # 从像素反推局部坐标
     y_local = (push_u - 160.0) / PPM

@@ -2,8 +2,19 @@
 PushNet 模型评估脚本
 加载训练好的模型进行仿真评估，统计成功率、崩飞次数等指标，并输出 CSV 日志
 
+支持多批次评估：
+1. 通过 --n_batches 自动生成多个随机种子，每个种子独立运行一批评估
+2. 通过 --seeds 手动指定多个随机种子，每个种子独立运行一批评估
+
 使用示例:
+    # 单批次评估
     python eval.py --model_path /path/to/model.pth --n_episodes 100 --seed 42
+
+    # 多批次评估：自动生成6个随机种子，每批运行300 episodes
+    python eval.py --model_path /path/to/model.pth --n_batches 6 --n_episodes 300
+
+    # 多批次评估：依次使用种子1、2、3各运行300 episodes
+    python eval.py --model_path /path/to/model.pth --n_episodes 300 --seeds 1 2 3
 """
 
 import os
@@ -11,6 +22,8 @@ import sys
 import argparse
 import csv
 import gc
+import re
+import random
 import torch
 import numpy as np
 from datetime import datetime
@@ -36,21 +49,25 @@ def parse_args():
 
     # 模型参数
     parser.add_argument('--model_path', type=str,
-                        default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/equi_obj_9/model_final.pth',
-                        help='训练好的模型文件路径')
+                        default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/new_MAML/equi_obj_9/model_meta_200.pth',
+                        help='模型文件路径')
     parser.add_argument('--use_equivariant', action='store_true', default=True,
                         help='是否使用C4等变网络（默认开启）')
 
     # 评估参数
-    parser.add_argument('--n_episodes', default=200, type=int, help='评估轮数')
+    parser.add_argument('--n_episodes', default=300, type=int, help='每批次评估轮数')
+    parser.add_argument('--n_batches', default=1, type=int,
+                        help='评估批数；未指定 --seed/--seeds 时自动生成对应数量的随机种子')
     parser.add_argument('--seed', default=None, type=int,
-                        help='随机种子（不指定则自动随机生成）')
+                        help='单个随机种子（与 --seeds 互斥）')
+    parser.add_argument('--seeds', default=None, type=int, nargs='+',
+                        help='多个随机种子，每个种子独立运行一批评估（与 --seed 互斥）')
     parser.add_argument('--episode_max_steps', default=8, type=int,
                         help='每个 episode 最大步数')
 
     # 环境参数
-    parser.add_argument('--num_objects_min', default=7, type=int, help='最小物体数')
-    parser.add_argument('--num_objects_max', default=7, type=int, help='最大物体数')
+    parser.add_argument('--num_objects_min', default=9, type=int, help='最小物体数')
+    parser.add_argument('--num_objects_max', default=9, type=int, help='最大物体数')
     parser.add_argument('--num_envs', default=1, type=int, help='并行环境数量')
     parser.add_argument('--headless', action='store_true', default=True,
                         help='无界面模式 (默认开启)')
@@ -120,27 +137,29 @@ def print_step_log(step, max_steps, action_idx, invalid_actions, info,
 
 
 # ============================================================
-# 主函数
+# 单批次评估函数
 # ============================================================
-def main():
-    args = parse_args()
+def run_evaluation_batch(args, seed, env, agent, batch_idx=0, total_batches=1):
+    """
+    运行单批次评估：使用指定 seed 运行 n_episodes 轮评估并保存 CSV 日志。
+    返回 (success_rate, log_path)
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
-    # ---- 随机种子 ----
-    if args.seed is None:
-        args.seed = np.random.randint(0, 100000)
-
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
-    # 记录运行开始时间（用于日志文件命名）
     start_time = datetime.now()
     start_time_str = start_time.strftime("%Y%m%d_%H%M%S")
 
     # ---- 打印评估配置 ----
+    if total_batches > 1:
+        print("\n" + "█" * 80)
+        print(f"  批次 {batch_idx + 1}/{total_batches} | Seed: {seed}")
+        print("█" * 80)
     print("=" * 80)
     print("  PushNet 模型评估")
     print("=" * 80)
-    print(f"  随机种子 (Seed): {args.seed}")
+    print(f"  随机种子 (Seed): {seed}")
     print(f"  模型路径: {args.model_path}")
     print(f"  评估轮数: {args.n_episodes}")
     print(f"  每轮最大步数: {args.episode_max_steps}")
@@ -150,50 +169,6 @@ def main():
     net_type = "C4等变网络" if args.use_equivariant else "普通CNN网络"
     print(f"  网络类型: {net_type}")
     print("=" * 80)
-
-    # ---- 检查模型文件 ----
-    if not os.path.exists(args.model_path):
-        print(f"❌ 错误: 模型文件不存在: {args.model_path}")
-        sys.exit(1)
-
-    # 确保 Isaac Sim 参数
-    if "--enable_cameras" not in sys.argv:
-        sys.argv.append("--enable_cameras")
-    if args.headless and "--headless" not in sys.argv:
-        sys.argv.append("--headless")
-
-    # ============================================================
-    # 初始化场景、环境、Agent
-    # ============================================================
-    print("\n[1/3] 初始化场景...")
-    scene = Scene(description="Model Evaluation", num_envs=args.num_envs)
-
-    print("[2/3] 创建环境...")
-    env = PushEnv(scene=scene, args=args)
-    env.max_steps_per_episode = args.episode_max_steps
-
-    print("[3/3] 加载模型...")
-    agent = DQNAgent(
-        device=args.device,
-        lr=1e-4,
-        gamma=0.99,
-        buffer_capacity=100,
-        use_equivariant=args.use_equivariant
-    )
-
-    checkpoint = torch.load(args.model_path, map_location=args.device)
-    if 'policy_net' in checkpoint:
-        agent.policy_net.load_state_dict(checkpoint['policy_net'])
-        if 'target_net' in checkpoint:
-            agent.target_net.load_state_dict(checkpoint['target_net'])
-        print("  ✓ 模型加载成功 (checkpoint 格式)")
-    else:
-        agent.policy_net.load_state_dict(checkpoint)
-        agent.target_net.load_state_dict(agent.policy_net.state_dict())
-        print("  ✓ 模型加载成功 (权重格式)")
-
-    agent.policy_net.eval()
-    agent.target_net.eval()
 
     # ============================================================
     # 评估循环
@@ -260,6 +235,10 @@ def main():
                     if is_exploded:
                         print(f"\n  💥 [动作前检测] Env {env_idx} "
                               f"物体已崩飞: {out_reason}")
+                        episode_exploded = True
+                        episode_out_of_bounds = True
+                        episode_fail_reason = "物体崩飞"
+                        total_exploded += 1
                         pre_exploded = True
                         break
 
@@ -312,7 +291,13 @@ def main():
                     if infos[env_idx].get('is_exploded', False):
                         step_exploded = True
                         episode_exploded = True
+                        episode_out_of_bounds = True
                         episode_fail_reason = "物体崩飞"
+                        total_exploded += 1
+
+                if step_exploded:
+                    print(f"\n  💥 检测到物体崩飞，本次Episode将终止并重试...")
+                    should_retry = True
 
                 # ---- 打印每步日志 ----
                 for env_idx in range(args.num_envs):
@@ -336,7 +321,7 @@ def main():
                         invalid_actions[env_idx] = []
 
                     # 记录结果标记
-                    if info.get('success', False):
+                    if (not step_exploded) and info.get('success', False):
                         episode_success = True
                     if info.get('out_of_bounds', False):
                         episode_out_of_bounds = True
@@ -389,9 +374,7 @@ def main():
         # 更新统计
         if episode_success:
             total_success += 1
-        if episode_exploded:
-            total_exploded += 1
-        if episode_out_of_bounds:
+        if episode_out_of_bounds and not episode_exploded:
             total_out_of_bounds += 1
         total_empty_pushes += episode_empty_push_count
         total_steps_all += episode_steps
@@ -422,7 +405,7 @@ def main():
     print("\n" + "█" * 80)
     print("  评估完成 - 最终统计")
     print("█" * 80)
-    print(f"  随机种子 (Seed): {args.seed}")
+    print(f"  随机种子 (Seed): {seed}")
     print(f"  模型: {args.model_path}")
     print(f"  评估轮数: {args.n_episodes}")
     print(f"  ----------------------------------------")
@@ -439,18 +422,17 @@ def main():
     # 命名规则: 场景中的物体个数+随机种子+评估日期时间
     # 存放路径: 以本次评估使用的模型在训练时使用的物体数量命名的文件夹
     # ============================================================
-    
+
     # 提取评估时场景中的物体个数
     if args.num_objects_min == args.num_objects_max:
         scene_obj_str = str(args.num_objects_max)
     else:
         scene_obj_str = f"{args.num_objects_min}-{args.num_objects_max}"
-        
-    log_filename = f"{scene_obj_str}_{args.seed}_{start_time_str}.csv"
+
+    log_filename = f"{scene_obj_str}_{seed}_{start_time_str}.csv"
 
     # 提取训练时使用的物体数量作为文件夹名
     model_dir_name = Path(args.model_path).parent.name
-    import re
     match = re.search(r'obj_(\d+(?:_\d+)?)', model_dir_name)
     if match:
         train_obj_num = match.group(1)
@@ -472,7 +454,7 @@ def main():
         # ---- 元信息 ----
         writer.writerow(['# 评估配置'])
         writer.writerow(['model_path', args.model_path])
-        writer.writerow(['seed', args.seed])
+        writer.writerow(['seed', seed])
         writer.writerow(['n_episodes', args.n_episodes])
         writer.writerow(['episode_max_steps', args.episode_max_steps])
         writer.writerow(['num_objects_range',
@@ -501,18 +483,141 @@ def main():
             ])
 
     print(f"\n✓ 评估日志已保存到: {log_path}")
+    return success_rate, log_path
 
-    # 使用 os._exit(0) 强制结束进程，
-    # 避免 simulation_app.close() 在清理 Replicator/SyntheticData 图节点时出现无限报错。
+
+# ============================================================
+# 主函数
+# ============================================================
+def main():
+    args = parse_args()
+
+    # ---- 参数校验 ----
+    if args.n_batches <= 0:
+        print("❌ 错误: --n_batches 必须大于 0")
+        sys.exit(1)
+
+    # ---- 确定种子列表 ----
+    if args.seeds and args.seed is not None:
+        print("❌ 错误: --seed 和 --seeds 不能同时使用")
+        sys.exit(1)
+
+    if args.seeds:
+        seed_list = args.seeds
+    elif args.seed is not None:
+        if args.n_batches > 1:
+            print("❌ 错误: --seed 只支持单批评估；如需多批评估，"
+                  "请使用 --seeds 手动指定多个种子，或去掉 --seed "
+                  "让 --n_batches 自动生成随机种子")
+            sys.exit(1)
+        seed_list = [args.seed]
+    else:
+        seed_list = np.random.choice(
+            100000, size=args.n_batches, replace=False
+        ).tolist()
+
+    # ---- 检查模型文件 ----
+    if not os.path.exists(args.model_path):
+        print(f"❌ 错误: 模型文件不存在: {args.model_path}")
+        sys.exit(1)
+
+    # 确保 Isaac Sim 参数
+    if "--enable_cameras" not in sys.argv:
+        sys.argv.append("--enable_cameras")
+    if args.headless and "--headless" not in sys.argv:
+        sys.argv.append("--headless")
+
+    # ============================================================
+    # 执行多批次评估
+    # 注意: Isaac Sim 的 SimulationApp 不支持在同一进程中反复初始化。
+    # 因此 Scene/Env/Agent 只创建一次，多批次通过不同 seed 重复 reset/evaluate。
+    # ============================================================
+    total_batches = len(seed_list)
+    all_results = []
+
+    if total_batches > 1:
+        print("\n" + "█" * 80)
+        print(f"  多批次评估模式: 共 {total_batches} 批, "
+              f"每批 {args.n_episodes} episodes")
+        print(f"  Seeds: {seed_list}")
+        print("█" * 80)
+
+    print("\n[初始化] 创建评估资源")
+    print("  [1/3] 初始化场景...")
+    scene = Scene(description="Model Evaluation", num_envs=args.num_envs)
+
+    print("  [2/3] 创建环境...")
+    env = PushEnv(scene=scene, args=args)
+    env.max_steps_per_episode = args.episode_max_steps
+
+    print("  [3/3] 加载模型...")
+    agent = DQNAgent(
+        device=args.device,
+        lr=1e-4,
+        gamma=0.99,
+        buffer_capacity=100,
+        use_equivariant=args.use_equivariant
+    )
+
+    checkpoint = torch.load(args.model_path, map_location=args.device)
+    if 'policy_net' in checkpoint:
+        agent.policy_net.load_state_dict(checkpoint['policy_net'])
+        if 'target_net' in checkpoint:
+            agent.target_net.load_state_dict(checkpoint['target_net'])
+        print("  ✓ 模型加载成功 (checkpoint 格式)")
+    else:
+        agent.policy_net.load_state_dict(checkpoint)
+        agent.target_net.load_state_dict(agent.policy_net.state_dict())
+        print("  ✓ 模型加载成功 (权重格式)")
+
+    agent.policy_net.eval()
+    agent.target_net.eval()
+    del checkpoint
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    for batch_idx, seed in enumerate(seed_list):
+        # ---- 运行本批次评估 ----
+        success_rate, log_path = run_evaluation_batch(
+            args, seed, env, agent,
+            batch_idx=batch_idx, total_batches=total_batches
+        )
+        all_results.append({
+            'seed': seed,
+            'success_rate': success_rate,
+            'log_path': log_path
+        })
+
+        # ---- 批次结束，清除缓存释放资源 ----
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # ============================================================
+    # 多批次汇总
+    # ============================================================
+    if total_batches > 1:
+        print("\n" + "█" * 80)
+        print("  所有批次评估完成 - 汇总")
+        print("█" * 80)
+        for r in all_results:
+            print(f"  Seed {r['seed']:>6d}: 成功率 {r['success_rate']:.2f}%"
+                  f"  | 日志: {r['log_path']}")
+        avg_rate = sum(r['success_rate'] for r in all_results) / total_batches
+        print(f"  ----------------------------------------")
+        print(f"  平均成功率: {avg_rate:.2f}%")
+        print("█" * 80)
+
     os._exit(0)
 
 
 if __name__ == "__main__":
     main()
 
-# # 基本用法
+# # 基本用法（单批次）
 # python eval/eval.py --model_path /path/to/model.pth --n_episodes 100 --seed 42
 
-# # 自定义参数
-# python eval.py --model_path /home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/equi_obj_9/model_final.pth --n_episodes 200 --seed 123 --episode_max_steps 8 --num_objects_min 7 --num_objects_max 9
-# python eval.py --model_path /home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/equi_obj_4/model_final.pth --n_episodes 500 --num_objects_min 4 --num_objects_max 4
+# # 多批次评估：自动生成6个随机种子，每批运行300 episodes
+# python eval/eval.py --model_path /path/to/model.pth --n_batches 6 --n_episodes 300
+
+# # 多批次评估：依次使用种子1、2、3各运行300 episodes
+# python eval/eval.py --model_path /path/to/model.pth --n_episodes 300 --seeds 1 2 3

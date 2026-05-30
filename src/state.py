@@ -28,8 +28,8 @@ class State:
     #     return self._sam
         
         # Define workspace limits for normalization (adjust as needed)
-        self.x_min, self.x_max = 0.375, 1.125
-        self.y_min, self.y_max = -0.375, 0.375
+        self.x_min, self.x_max = 0.25, 1.25
+        self.y_min, self.y_max = -0.50, 0.50
         
         # Image resolution
         self.img_width = 320
@@ -385,7 +385,7 @@ class State:
         [输出]: u, v (int)
         """
         WS_CENTER_X, WS_CENTER_Y = 0.75, 0.0
-        PIXELS_PER_METER = 320 / 0.75
+        PIXELS_PER_METER = 320 / 1.0
         
         x_world = world_pos[0].item() if isinstance(world_pos, torch.Tensor) else world_pos[0]
         y_world = world_pos[1].item() if isinstance(world_pos, torch.Tensor) else world_pos[1]

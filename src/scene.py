@@ -356,7 +356,7 @@ class Scene:
                 eid = 0
             env_objs.setdefault(eid, []).append(obj)
         
-        # [修改] 聚拢方向改为朝着目标物体中心，而不是所有物体的几何中心
+        # 聚拢方向改为朝着目标物体中心，而不是所有物体的几何中心
         env_target_pos = {}
         for eid, objs in env_objs.items():
             target_obj = None
@@ -373,7 +373,7 @@ class Scene:
                 env_target_pos[eid] = torch.mean(positions, dim=0)
         
         gather_steps = 48
-        gather_strength = 6.0  # 降低聚拢力，避免物体挤压后崩飞
+        gather_strength = 7.0  # 降低聚拢力，避免物体挤压后崩飞
         
         for step in range(gather_steps):
             dt = self.sim.get_physics_dt()
@@ -698,12 +698,12 @@ class Scene:
         if force_task_config is not None and 'obstacle_model_dir' in force_task_config:
             ycb_root = force_task_config['obstacle_model_dir']
         else:
-            ycb_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_CH"
+            ycb_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata/meshdata_CH"
         
         if force_task_config is not None and 'target_model_dir' in force_task_config:
             ycb_target_root = force_task_config['target_model_dir']
         else:
-            ycb_target_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata_target"
+            ycb_target_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata/meshdata_target"
         
         # 查找所有包含 textured.usd 的模型
         get_models = lambda root: [d for d in os.listdir(root) if os.path.exists(os.path.join(root, d, "textured.usd"))] if os.path.exists(root) else []

@@ -37,7 +37,9 @@ def load_training_log(model_type: str, num_objects: int, base_dir: str = DEFAULT
         base_dir: 结果根目录
         
     Returns:
-        DataFrame with columns: episode, step, loss, reward
+        DataFrame with training columns. Supports both:
+        - episode, step, loss, reward
+        - meta_iter, meta_loss, avg_reward
     """
     folder_name = f"{model_type}_obj_{num_objects}"
     csv_path = os.path.join(base_dir, folder_name, "training_log.csv")
@@ -56,6 +58,62 @@ def smooth_data(data: list, window: int = 10) -> np.array:
     if len(data) < window:
         return np.array(data)
     return np.convolve(data, np.ones(window)/window, mode='valid')
+
+
+def get_first_existing_column(data: pd.DataFrame, candidates: list) -> str:
+    """从候选列名中返回第一个存在的列。"""
+    for column in candidates:
+        if column in data.columns:
+            return column
+    raise KeyError(
+        f"找不到所需列，候选列: {candidates}，当前CSV列: {list(data.columns)}"
+    )
+
+
+def resolve_plot_columns(data: pd.DataFrame, x_axis: str):
+    """兼容旧 DQN 日志和当前 MAML 日志的列名。"""
+    if x_axis == "episode":
+        x_candidates = [("episode", "Episode"),
+                        ("meta_iter", "Meta-Iteration"),
+                        ("step", "Training Step")]
+    else:
+        x_candidates = [("step", "Training Step"),
+                        ("meta_iter", "Meta-Iteration"),
+                        ("episode", "Episode")]
+
+    x_col = None
+    x_label = None
+    for column, label in x_candidates:
+        if column in data.columns:
+            x_col = column
+            x_label = label
+            break
+
+    if x_col is None:
+        raise KeyError(
+            f"找不到横轴列，候选列: {[c for c, _ in x_candidates]}，"
+            f"当前CSV列: {list(data.columns)}"
+        )
+
+    loss_col = get_first_existing_column(data, ["loss", "meta_loss"])
+    reward_col = get_first_existing_column(data, ["reward", "avg_reward"])
+
+    if x_axis == "step" and x_col != "step":
+        print(f"⚠ 当前CSV没有 step 列，已使用 {x_col} 作为横轴")
+    elif x_axis == "episode" and x_col != "episode":
+        print(f"⚠ 当前CSV没有 episode 列，已使用 {x_col} 作为横轴")
+
+    loss_label = "Meta Loss" if loss_col == "meta_loss" else "Loss"
+    reward_label = "Average Reward" if reward_col == "avg_reward" else "Reward"
+
+    return {
+        "x": data[x_col].values,
+        "x_label": x_label,
+        "loss": data[loss_col].values,
+        "loss_label": loss_label,
+        "reward": data[reward_col].values,
+        "reward_label": reward_label,
+    }
 
 
 def plot_single(model_type: str, num_objects: int, base_dir: str = DEFAULT_BASE_DIR,
@@ -89,36 +147,39 @@ def plot_single(model_type: str, num_objects: int, base_dir: str = DEFAULT_BASE_
     color = 'blue' if model_type == 'cnn' else 'red'
     label = 'CNN' if model_type == 'cnn' else 'Equivariant'
     
-    # 选择横轴：episode 或 step
-    if x_axis == "episode" and "episode" in data.columns:
-        x = data["episode"].values
-        x_label = "Episode"
-    else:
-        x = data["step"].values
-        x_label = "Training Step"
+    try:
+        columns = resolve_plot_columns(data, x_axis)
+    except KeyError as e:
+        print(f"✗ CSV列不兼容: {e}")
+        return
+
+    x = columns["x"]
+    x_label = columns["x_label"]
+    loss_label = columns["loss_label"]
+    reward_label = columns["reward_label"]
     
     # ============ Loss 与 Reward 同一张图（上下两个子图） ============
     fig, (ax_loss, ax_reward) = plt.subplots(2, 1, figsize=fig_size, sharex=True)
 
     # Loss 子图
-    loss = data['loss'].values
+    loss = columns["loss"]
     loss_smooth = smooth_data(loss, window)
-    ax_loss.plot(x, loss, alpha=0.3, color=color, label='Loss Raw')
+    ax_loss.plot(x, loss, alpha=0.3, color=color, label=f'{loss_label} Raw')
     ax_loss.plot(x[:len(loss_smooth)], loss_smooth,
-                 color=color, linewidth=2, label=f'Loss MA{window}')
-    ax_loss.set_ylabel('Loss', fontsize=12)
+                 color=color, linewidth=2, label=f'{loss_label} MA{window}')
+    ax_loss.set_ylabel(loss_label, fontsize=12)
     ax_loss.set_title(f'{label} Training - {num_objects} Objects', fontsize=14)
     ax_loss.legend(fontsize=9)
     ax_loss.grid(True, alpha=0.3)
 
     # Reward 子图
-    reward = data['reward'].values
+    reward = columns["reward"]
     reward_smooth = smooth_data(reward, window)
-    ax_reward.plot(x, reward, alpha=0.3, color=color, label='Reward Raw')
+    ax_reward.plot(x, reward, alpha=0.3, color=color, label=f'{reward_label} Raw')
     ax_reward.plot(x[:len(reward_smooth)], reward_smooth,
-                   color=color, linewidth=2, label=f'Reward MA{window}')
+                   color=color, linewidth=2, label=f'{reward_label} MA{window}')
     ax_reward.set_xlabel(x_label, fontsize=12)
-    ax_reward.set_ylabel('Reward', fontsize=12)
+    ax_reward.set_ylabel(reward_label, fontsize=12)
     ax_reward.legend(fontsize=9)
     ax_reward.grid(True, alpha=0.3)
 
@@ -158,12 +219,12 @@ def plot_comparison(num_objects: int, base_dir: str = DEFAULT_BASE_DIR,
         plt.style.use('seaborn-whitegrid')
     fig_size = (12, 6)
 
-    # 选择横轴：episode 或 step
-    def get_x_and_label(df):
-        if x_axis == "episode" and "episode" in df.columns:
-            return df["episode"].values, "Episode"
-        else:
-            return df["step"].values, "Training Step"
+    def get_plot_columns(df):
+        try:
+            return resolve_plot_columns(df, x_axis)
+        except KeyError as e:
+            print(f"✗ 跳过不兼容CSV: {e}")
+            return None
     
     # ============ Loss 与 Reward 对比，同一张图（上下两个子图） ============
     fig, (ax_loss, ax_reward) = plt.subplots(2, 1, figsize=fig_size, sharex=True)
@@ -171,22 +232,42 @@ def plot_comparison(num_objects: int, base_dir: str = DEFAULT_BASE_DIR,
     # Loss 子图
     x_label = "Training Step"
     if cnn_data is not None:
-        steps_cnn, x_label = get_x_and_label(cnn_data)
-        loss_cnn = cnn_data['loss'].values
+        cnn_columns = get_plot_columns(cnn_data)
+    else:
+        cnn_columns = None
+    if equi_data is not None:
+        equi_columns = get_plot_columns(equi_data)
+    else:
+        equi_columns = None
+
+    if cnn_columns is None and equi_columns is None:
+        print("✗ 没有可绘制的兼容训练数据")
+        plt.close(fig)
+        return
+
+    if cnn_columns is not None:
+        steps_cnn = cnn_columns["x"]
+        x_label = cnn_columns["x_label"]
+        loss_cnn = cnn_columns["loss"]
         loss_cnn_smooth = smooth_data(loss_cnn, window)
         
-        ax_loss.plot(steps_cnn, loss_cnn, alpha=0.2, color='blue', label='CNN Loss Raw')
+        ax_loss.plot(steps_cnn, loss_cnn, alpha=0.2, color='blue',
+                     label=f'CNN {cnn_columns["loss_label"]} Raw')
         ax_loss.plot(steps_cnn[:len(loss_cnn_smooth)], loss_cnn_smooth, 
-                     color='blue', linewidth=2, label=f'CNN Loss MA{window}')
+                     color='blue', linewidth=2,
+                     label=f'CNN {cnn_columns["loss_label"]} MA{window}')
     
-    if equi_data is not None:
-        steps_equi, x_label = get_x_and_label(equi_data)
-        loss_equi = equi_data['loss'].values
+    if equi_columns is not None:
+        steps_equi = equi_columns["x"]
+        x_label = equi_columns["x_label"]
+        loss_equi = equi_columns["loss"]
         loss_equi_smooth = smooth_data(loss_equi, window)
         
-        ax_loss.plot(steps_equi, loss_equi, alpha=0.2, color='red', label='Equivariant Loss Raw')
+        ax_loss.plot(steps_equi, loss_equi, alpha=0.2, color='red',
+                     label=f'Equivariant {equi_columns["loss_label"]} Raw')
         ax_loss.plot(steps_equi[:len(loss_equi_smooth)], loss_equi_smooth, 
-                     color='red', linewidth=2, label=f'Equivariant Loss MA{window}')
+                     color='red', linewidth=2,
+                     label=f'Equivariant {equi_columns["loss_label"]} MA{window}')
     
     ax_loss.set_ylabel('Loss', fontsize=12)
     ax_loss.set_title(f'Loss & Reward Comparison - {num_objects} Objects', fontsize=14)
@@ -194,23 +275,29 @@ def plot_comparison(num_objects: int, base_dir: str = DEFAULT_BASE_DIR,
     ax_loss.grid(True, alpha=0.3)
     
     # Reward 子图
-    if cnn_data is not None:
-        steps_cnn, x_label = get_x_and_label(cnn_data)
-        reward_cnn = cnn_data['reward'].values
+    if cnn_columns is not None:
+        steps_cnn = cnn_columns["x"]
+        x_label = cnn_columns["x_label"]
+        reward_cnn = cnn_columns["reward"]
         reward_cnn_smooth = smooth_data(reward_cnn, window)
         
-        ax_reward.plot(steps_cnn, reward_cnn, alpha=0.2, color='blue', label='CNN Reward Raw')
+        ax_reward.plot(steps_cnn, reward_cnn, alpha=0.2, color='blue',
+                       label=f'CNN {cnn_columns["reward_label"]} Raw')
         ax_reward.plot(steps_cnn[:len(reward_cnn_smooth)], reward_cnn_smooth, 
-                       color='blue', linewidth=2, label=f'CNN Reward MA{window}')
+                       color='blue', linewidth=2,
+                       label=f'CNN {cnn_columns["reward_label"]} MA{window}')
     
-    if equi_data is not None:
-        steps_equi, x_label = get_x_and_label(equi_data)
-        reward_equi = equi_data['reward'].values
+    if equi_columns is not None:
+        steps_equi = equi_columns["x"]
+        x_label = equi_columns["x_label"]
+        reward_equi = equi_columns["reward"]
         reward_equi_smooth = smooth_data(reward_equi, window)
         
-        ax_reward.plot(steps_equi, reward_equi, alpha=0.2, color='red', label='Equivariant Reward Raw')
+        ax_reward.plot(steps_equi, reward_equi, alpha=0.2, color='red',
+                       label=f'Equivariant {equi_columns["reward_label"]} Raw')
         ax_reward.plot(steps_equi[:len(reward_equi_smooth)], reward_equi_smooth, 
-                       color='red', linewidth=2, label=f'Equivariant Reward MA{window}')
+                       color='red', linewidth=2,
+                       label=f'Equivariant {equi_columns["reward_label"]} MA{window}')
     
     ax_reward.set_xlabel(x_label, fontsize=12)
     ax_reward.set_ylabel('Reward', fontsize=12)
