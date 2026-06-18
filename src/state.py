@@ -244,6 +244,77 @@ class State:
 
         return resized_rgb, resized_depth, resized_seg
 
+    def _is_obj_in_env(self, obj):
+        """
+        [功能]: 判断物体的 prim_path 是否属于当前 env_idx。
+        [输入]: obj (RigidObject)
+        [输出]: bool
+        """
+        if self.env_idx is None:
+            return True
+        path = obj.cfg.prim_path
+        if f"/Scene_{self.env_idx}/" in path:
+            return True
+        # 单环境约定：/World/Scene/...，env_idx 默认为 0
+        if self.env_idx == 0 and "/Scene/" in path and "/Scene_" not in path:
+            return True
+        return False
+
+    def get_target_object(self, spawned_objects):
+        """
+        [功能]: 获取当前 env 的目标物体引用 (名称包含 'Target_')。
+        [输入]: spawned_objects (list)
+        [输出]: target_obj (RigidObject) 或 None
+        """
+        if not spawned_objects:
+            return None
+        for obj in spawned_objects:
+            if not self._is_obj_in_env(obj):
+                continue
+            obj_name = obj.cfg.prim_path.split('/')[-1]
+            if "Target_" in obj_name:
+                return obj
+        return None
+
+    def get_object_ids(self, seg_img, spawned_objects):
+        """
+        [功能]: 识别当前 env 下所有生成物体的 seg ID（排除桌面和背景）。
+        [输入]: seg_img (np.ndarray), spawned_objects (list)
+        [输出]: (all_object_ids: set, target_id: int or None)
+        """
+        import numpy as np
+
+        all_object_ids = set()
+        target_id = None
+        if seg_img is None:
+            return all_object_ids, target_id
+
+        h, w = seg_img.shape
+        for obj in spawned_objects:
+            if not self._is_obj_in_env(obj):
+                continue
+            pos_3d = obj.data.root_pos_w[0].cpu().numpy()
+            u, v = self.world_to_pixel([pos_3d[0], pos_3d[1]])
+            u_c = np.clip(u, 0, w - 1)
+            v_c = np.clip(v, 0, h - 1)
+            oid = seg_img[v_c, u_c]
+            if oid != 0:
+                all_object_ids.add(oid)
+                if "Target_" in obj.cfg.prim_path.split("/")[-1]:
+                    target_id = oid
+
+        return all_object_ids, target_id
+
+    @staticmethod
+    def build_obstacle_mask(seg_img, obstacle_ids):
+        """
+        [功能]: 创建障碍物掩膜（仅包含指定 ID 的像素）。
+        [输入]: seg_img (np.ndarray), obstacle_ids (set/list)
+        [输出]: np.ndarray (H, W) uint8, 障碍物像素=255, 其余=0
+        """
+        import numpy as np
+        return np.isin(seg_img, list(obstacle_ids)).astype(np.uint8) * 255
+
     def extract_global_mask(self, seg_img, exclude_floor=True):
         """
         [功能]: 提取全局掩膜 - 所有物体的合并掩膜
@@ -296,34 +367,10 @@ class State:
         if not spawned_objects:
             print("⚠ 警告: 物体列表为空")
             return None
-        
+
         # 1. 找到目标物体
-        # 1. 找到目标物体
-        target_obj = None
-        for obj in spawned_objects:
-            path = obj.cfg.prim_path
-            
-            # [Fix] 过滤非当前环境的物体
-            if self.env_idx is not None:
-                # 检查路径是否包含当前环境ID
-                # 多环境: /World/Scene_{i}/...
-                # 单环境: /World/Scene/... (等同于 Env 0)
-                
-                # Check for explicit Scene_{i} match
-                if f"/Scene_{self.env_idx}/" in path:
-                    pass # Match
-                # Check for implicit Env 0 match (single env legacy)
-                elif self.env_idx == 0 and "/Scene/" in path and "/Scene_" not in path:
-                    pass # Match
-                else:
-                    continue # Not in this env
-            
-            obj_name = path.split('/')[-1]
-            if "Target_" in obj_name:
-                target_obj = obj
-                # print(f"\n[目标掩膜] 找到目标物体: {obj_name}")
-                break
-        
+        target_obj = self.get_target_object(spawned_objects)
+
         if target_obj is None:
             print(f"⚠ 警告[Env{self.env_idx}]: 未找到目标物体 (名称包含'Target_')")
             print(f"  - spawned_objects数量: {len(spawned_objects)}")

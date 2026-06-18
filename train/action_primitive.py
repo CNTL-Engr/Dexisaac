@@ -168,7 +168,7 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
             # Fallback: 全局扇形
             search_mask = sector_mask > 0
             
-        # 4. 新逻辑：寻找安全推点（夹爪范围内无碰撞）
+        # 4. 寻找安全推点（夹爪范围内无碰撞）
         # 条件：夹爪范围内所有像素的高度都必须低于夹爪下降高度
         
         # 定义夹爪尺寸 (像素)
@@ -191,8 +191,8 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
         
         # 相机高度
         CAMERA_Z = 1.25
-        # 安全余量：夹爪下降高度 = 最高点 + 1cm
-        SAFETY_MARGIN = 0.01
+        # 安全余量：夹爪下降高度 = 最高点 + 0.8cm
+        SAFETY_MARGIN = 0.008
         
         # 在搜索区域内寻找安全推点
         # 策略：找 eroded_depth 最大的点（即夹爪范围内最高点最低的位置）

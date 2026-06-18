@@ -31,8 +31,8 @@ def parse_args():
 
     # 环境参数
     parser.add_argument('--num_envs', default=1, type=int, help='并行环境数量')
-    parser.add_argument('--num_objects_min', default=4, type=int, help='最小障碍物数 (即 BASE_OBSTACLE_COUNT)')
-    parser.add_argument('--num_objects_max', default=7, type=int, help='最大障碍物数 (即 BASE_OBSTACLE_COUNT + NUM_TASKS - 1)')
+    parser.add_argument('--num_objects_min', default=5, type=int, help='最小总物体数 (目标物体1个 + 障碍物)')
+    parser.add_argument('--num_objects_max', default=10, type=int, help='最大总物体数 (目标物体1个 + 障碍物)')
     parser.add_argument('--episode_max_steps', default=8, type=int, help='每个 episode 最大步数')
     parser.add_argument('--headless', action='store_true', default=True)
     parser.add_argument('--no-headless', dest='headless', default=False, action='store_false')
@@ -41,9 +41,21 @@ def parse_args():
     parser.add_argument('--n_meta_iterations', default=700, type=int, help='元迭代总数')
     parser.add_argument('--task_batch_size', default=4, type=int, help='每次元更新的任务数')
     parser.add_argument(
-        '--task_sampling', default='random',
-        choices=['random', 'curriculum', 'curriculum_random', 'balanced'],
-        help='任务采样模式: random/curriculum/curriculum_random/balanced'
+        '--task_sampling', default='fixed_plus_random',
+        choices=['random', 'curriculum', 'curriculum_random', 'balanced', 'fixed_plus_random'],
+        help='任务采样模式: random/curriculum/curriculum_random/balanced/fixed_plus_random'
+    )
+    parser.add_argument(
+        '--fixed_task_obstacle_count',
+        default=9,
+        type=int,
+        help='fixed_plus_random 模式下固定抽取的子任务障碍物数量'
+    )
+    parser.add_argument(
+        '--fixed_task_count',
+        default=2,
+        type=int,
+        help='fixed_plus_random 模式下固定子任务的抽取次数'
     )
     parser.add_argument('--curriculum_interval', default=175, type=int, help='课程等级切换间隔 (meta-iterations)')
     parser.add_argument('--support_episodes', default=2, type=int, help='每个任务的 Support 轮数')
@@ -64,17 +76,17 @@ def parse_args():
 
     # 保存参数
     parser.add_argument('--save_every', default=50, type=int, help='保存频率 (meta-iterations)')
-    parser.add_argument('--checkpoint_base_dir', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/new_MAML', type=str)
+    parser.add_argument('--checkpoint_base_dir', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/PCA_judge', type=str)
     parser.add_argument('--save_intermediate', action='store_true', default=True)
 
     # 模型加载参数
     parser.add_argument('--load_model', action='store_true', default=True)
-    parser.add_argument('--model_path', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/pre_equi_obj_4/model_episode_3000.pth', type=str)
+    parser.add_argument('--model_path', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/PCA_judge/equi_obj_5_9/model_meta_100.pth', type=str)
     parser.add_argument('--resume_meta_iter', default=0, type=int, help='从指定 meta-iteration 恢复')
     parser.add_argument('--resume_path', default='', type=str, help='显式指定恢复训练 checkpoint 路径')
     parser.add_argument('--use_equivariant', action='store_true', default=True)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--seed', default=525, type=int)
+    parser.add_argument('--seed', default=666, type=int)
 
     return parser.parse_args()
 
@@ -86,13 +98,9 @@ ACTION_NAMES = [
 
 
 def make_force_task_config(task_generator, target_pos, robot_pos, obstacle_count, task_model_dirs):
-    """为一个 episode 采样 task 内布局。retry 时复用返回的配置。"""
-    obstacle_positions = task_generator.generate_positions_for_task(
-        target_pos, robot_pos, obstacle_count
-    )
+    """为一个 episode 构造 task 约束；具体布局由 Scene 生成并回写。"""
     return {
-        'target_pos': target_pos,
-        'obstacle_positions': obstacle_positions,
+        'obstacle_count': obstacle_count,
         'obstacle_model_dir': task_model_dirs['obstacle_dir'],
         'target_model_dir': task_model_dirs['target_dir'],
     }
@@ -100,10 +108,65 @@ def make_force_task_config(task_generator, target_pos, robot_pos, obstacle_count
 
 def print_spawned_positions(spawned_objects, force_task_config, label="环境布局"):
     """打印环境生成时的物体位置信息"""
-    print(f"    [{label}] 目标位置: {force_task_config['target_pos']}")
-    print(f"    [{label}] 障碍物数量: {len(force_task_config['obstacle_positions'])}")
-    for i, pos in enumerate(force_task_config['obstacle_positions']):
+    target_pos = force_task_config.get('target_pos', [0.75, 0.0, 0.06])
+    obstacle_positions = force_task_config.get('obstacle_positions')
+    obstacle_count = force_task_config.get(
+        'obstacle_count',
+        len(obstacle_positions) if obstacle_positions is not None else 0
+    )
+    print(f"    [{label}] 目标位置: {target_pos}")
+    print(f"    [{label}] 障碍物数量: {obstacle_count}")
+    if obstacle_positions is None:
+        print(f"      障碍物位置: 将由 Scene.create_clutter_environment 生成")
+        return
+    for i, pos in enumerate(obstacle_positions):
         print(f"      障碍物 {i}: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
+
+
+def validate_fixed_plus_random_args(args):
+    if args.task_sampling != 'fixed_plus_random':
+        return None
+
+    if args.fixed_task_count <= 0:
+        raise ValueError('--fixed_task_count 必须大于 0')
+
+    if args.fixed_task_count > args.task_batch_size:
+        raise ValueError(
+            '--fixed_task_count 不能大于 --task_batch_size: '
+            f'{args.fixed_task_count} > {args.task_batch_size}'
+        )
+
+    min_obstacles = args.num_objects_min - 1
+    max_obstacles = args.num_objects_max - 1
+    obstacle_count = args.fixed_task_obstacle_count
+    if obstacle_count < min_obstacles or obstacle_count > max_obstacles:
+        raise ValueError(
+            '--fixed_task_obstacle_count 必须位于 '
+            f'[{min_obstacles}, {max_obstacles}]，'
+            f'当前为 {obstacle_count}。'
+            '注意: --num_objects_min/max 表示总物体数，'
+            '--fixed_task_obstacle_count 表示障碍物数。'
+        )
+
+    fixed_task_id = obstacle_count - min_obstacles
+    return [fixed_task_id] * args.fixed_task_count
+
+
+def sample_train_task_batch(args, task_generator, curriculum_level, fixed_task_ids=None):
+    if args.task_sampling != 'fixed_plus_random':
+        return task_generator.sample_task_batch(
+            args.task_batch_size,
+            mode=args.task_sampling,
+            curriculum_level=curriculum_level
+        )
+
+    task_ids = list(fixed_task_ids or [])
+    random_count = args.task_batch_size - len(task_ids)
+    task_ids.extend(
+        random.randint(0, task_generator.NUM_TASKS - 1)
+        for _ in range(random_count)
+    )
+    return task_ids
 
 
 def run_episode(env, agent, force_task_config, epsilon, max_steps, fast_weights=None):
@@ -217,6 +280,12 @@ def run_episode(env, agent, force_task_config, epsilon, max_steps, fast_weights=
 def main():
     args = parse_args()
 
+    try:
+        fixed_task_ids = validate_fixed_plus_random_args(args)
+    except ValueError as exc:
+        print(f"错误: {exc}")
+        os._exit(1)
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -236,6 +305,12 @@ def main():
     network_type = "C4等变网络" if args.use_equivariant else "普通CNN网络"
     print(f"MAML-DQN 训练 ({network_type})")
     print(f"  任务采样: {args.task_sampling}, 任务批大小: {args.task_batch_size}")
+    if args.task_sampling == 'fixed_plus_random':
+        random_task_count = args.task_batch_size - len(fixed_task_ids)
+        print(f"  固定障碍物数量: {args.fixed_task_obstacle_count}")
+        print(f"  固定抽取次数: {args.fixed_task_count}")
+        print(f"  固定 task_id: {fixed_task_ids}")
+        print(f"  每轮随机补齐任务数: {random_task_count}")
     print(f"  内循环: lr={args.inner_lr}, steps={args.inner_steps}, FOMAML={args.first_order}")
     print(f"  元迭代总数: {args.n_meta_iterations}")
     print("=" * 80)
@@ -260,8 +335,8 @@ def main():
     num_tasks = args.num_objects_max - args.num_objects_min + 1
     task_generator = ObstacleCountTaskGenerator(
         num_tasks=num_tasks,
-        base_obstacle_count=args.num_objects_min,
-        radius=0.21
+        base_obstacle_count=args.num_objects_min - 1,
+        radius=0.24
     )
     task_generator.print_model_dirs_config()
 
@@ -318,11 +393,11 @@ def main():
         iter_start = time.time()
 
         # 课程等级 (仅 curriculum 模式使用)
-        curriculum_level = min(meta_iter // args.curriculum_interval, ObstacleCountTaskGenerator.NUM_TASKS - 1)
+        curriculum_level = min(meta_iter // args.curriculum_interval, task_generator.NUM_TASKS - 1)
 
         # 采样任务批
-        task_ids = task_generator.sample_task_batch(
-            args.task_batch_size, mode=args.task_sampling, curriculum_level=curriculum_level
+        task_ids = sample_train_task_batch(
+            args, task_generator, curriculum_level, fixed_task_ids=fixed_task_ids
         )
 
         # Support 负责收集适应用数据，保留按 meta-iteration 衰减的探索。

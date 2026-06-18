@@ -3,7 +3,6 @@ MAML-DQN Agent for PushNet
 实现 MAML 双循环机制与象限密度任务生成器
 """
 
-import math
 import random
 import torch
 import torch.nn as nn
@@ -55,9 +54,9 @@ class ObstacleCountTaskGenerator:
       每个子任务可以指定独立的障碍物模型文件夹和目标物体模型文件夹。
       通过构造函数的 model_dirs 参数或 set_task_model_dirs 方法设置。
 
-    [坐标生成]:
-      使用纯 Numpy + math 库，以目标物体为圆心，在半径范围内
-      均匀随机采样障碍物坐标，并带有防碰撞检测。
+    [布局生成]:
+      物体位置由 Scene.create_clutter_environment() 统一生成。
+      本类只保留任务采样、障碍物数量和模型文件夹配置。
     """
 
     NUM_TASKS = 4  # 固定 4 种子任务（Task 0-3）
@@ -77,14 +76,14 @@ class ObstacleCountTaskGenerator:
     _DEFAULT_OBSTACLE_DIR = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata/meshdata_CH"
     _DEFAULT_TARGET_DIR = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata/meshdata_target"
 
-    def __init__(self, num_tasks=None, base_obstacle_count=None, radius=0.21, min_dist=0.06, max_attempts=1000, model_dirs=None):
+    def __init__(self, num_tasks=None, base_obstacle_count=None, radius=0.21, min_dist=0.07, max_attempts=1000, model_dirs=None):
         """
         [参数]:
           num_tasks          : 子任务数量，默认使用类属性 NUM_TASKS
           base_obstacle_count: 基础障碍物数量（Task 0 的障碍物数），默认使用类属性 BASE_OBSTACLE_COUNT
-          radius             : 障碍物分布的最大半径（以目标物体为圆心）
-          min_dist           : 障碍物中心之间的最小间距（防穿模）
-          max_attempts       : 单个障碍物放置时的最大尝试次数
+          radius             : 旧布局参数，保留用于兼容配置记录
+          min_dist           : 旧布局参数，保留用于兼容配置记录
+          max_attempts       : 旧布局参数，保留用于兼容配置记录
           model_dirs         : 每个子任务使用的模型文件夹配置 (dict 或 None)
         """
         if num_tasks is not None:
@@ -226,118 +225,6 @@ class ObstacleCountTaskGenerator:
             print(f"  Task {tid} ({self.TASK_NAMES[tid]}):")
             print(f"    障碍物模型: {dirs['obstacle_dir']}")
             print(f"    目标物体模型: {dirs['target_dir']}")
-
-    # ------------------------------------------------------------------ #
-    #  坐标生成（纯 Numpy + math 实现）
-    # ------------------------------------------------------------------ #
-    def generate_positions_for_task(self, target_pos, robot_pos, obstacle_count):
-        """
-        [功能]: 根据障碍物数量，以目标物体为圆心，在环形区域内
-                均匀随机生成障碍物的 2D 坐标，并附带防碰撞检测。
-
-        [输入]:
-          target_pos     : 目标物体中心位置 [x_t, y_t, z_t] (list 或 np.ndarray)
-          robot_pos      : 机器人基座中心位置 [x_r, y_r, z_r] (list 或 np.ndarray)
-          obstacle_count : 需要生成的障碍物数量 N (int)
-
-        [输出]:
-          List[ [x, y, z] ]  —— 标准 Python 列表，内含 list 形式的 2D+Z 坐标
-
-        [算法细节]:
-          1. 以目标物体 (x_t, y_t) 为圆心
-          2. 在 [r_inner, r_outer] 的环形区域内面积均匀采样
-          3. 角度在 [0, 2π) 上均匀分布
-          4. 防碰撞：新点与已有点的欧氏距离 >= min_dist
-          5. 若单点放置失败（超过 max_attempts 次），打印警告并强制放置
-
-        [边界情况]:
-          - obstacle_count <= 0 时，返回空列表
-          - obstacle_count 极大导致空间不足时，会打印警告
-        """
-        # ---- 边界检查：障碍物数量非正时直接返回空列表 ---- #
-        if obstacle_count <= 0:
-            print("[ObstacleCountTaskGenerator] 警告: obstacle_count <= 0，返回空列表")
-            return []
-
-        # ---- 提取目标物体的 XY 坐标和 Z 高度 ---- #
-        xt = float(target_pos[0])
-        yt = float(target_pos[1])
-        zt = float(target_pos[2])  # 障碍物的 Z 高度与目标物体保持一致
-
-        # ---- 采样参数 ---- #
-        r_inner = 0.05   # 内圈安全距离 (米), 避免与目标物体重叠
-        r_outer = self.radius  # 外圈最大半径
-
-        # ---- 辅助函数: 在环形区域内面积均匀采样单个点 ---- #
-        def _sample_one_point():
-            """
-            [功能]: 在以 (xt, yt) 为圆心的环形区域内采样一个点
-            [算法]: 面积均匀采样 r = sqrt(U * (R^2 - r_inner^2) + r_inner^2)
-                    角度 θ ~ Uniform(0, 2π)
-            [输出]: numpy.ndarray, shape=(2,), 全局 XY 坐标
-            """
-            # 面积均匀采样半径
-            u = np.random.uniform(0.0, 1.0)
-            r = math.sqrt(u * (r_outer ** 2 - r_inner ** 2) + r_inner ** 2)
-
-            # 均匀采样角度
-            theta = np.random.uniform(0.0, 2.0 * math.pi)
-
-            # 转换为直角坐标（全局坐标系）
-            px = xt + r * math.cos(theta)
-            py = yt + r * math.sin(theta)
-
-            return np.array([px, py])
-
-        # ---- 防碰撞检测函数 ---- #
-        def _has_collision(new_pt_xy, existing_pts_xy):
-            """
-            [功能]: 检查新点是否与已有点集中的任何点碰撞
-            [输入]: new_pt_xy   : numpy.ndarray, shape=(2,)
-                    existing_pts_xy : list of numpy.ndarray, 每个 shape=(2,)
-            [输出]: bool, True 表示存在碰撞
-            """
-            for ex_pt in existing_pts_xy:
-                dist = np.linalg.norm(new_pt_xy - ex_pt)
-                if dist < self.min_dist:
-                    return True
-            return False
-
-        # ---- 主循环：逐个放置障碍物 ---- #
-        obstacle_positions = []         # 最终输出：[x, y, z] 列表
-        existing_xy = [np.array([xt, yt])]  # 已占用的 XY 坐标列表（包含目标物体）
-
-        for i in range(obstacle_count):
-            placed = False
-            last_pt_xy = None
-
-            for _ in range(self.max_attempts):
-                pt_xy = _sample_one_point()
-                last_pt_xy = pt_xy
-
-                # 防碰撞检测
-                if not _has_collision(pt_xy, existing_xy):
-                    # 无碰撞，成功放置
-                    obstacle_positions.append([float(pt_xy[0]), float(pt_xy[1]), zt])
-                    existing_xy.append(pt_xy)
-                    placed = True
-                    break
-
-            # 如果超过最大尝试次数仍未找到合法位置，强制放置最后一次采样的点
-            if not placed:
-                print(f"[ObstacleCountTaskGenerator] 警告: 第 {i+1}/{obstacle_count} 个障碍物"
-                      f"在 {self.max_attempts} 次尝试后仍未找到无碰撞位置，强制放置！")
-                if last_pt_xy is not None:
-                    obstacle_positions.append([float(last_pt_xy[0]), float(last_pt_xy[1]), zt])
-                    existing_xy.append(last_pt_xy)
-                else:
-                    # 极端兜底：放在目标物体正上方偏移位置
-                    fallback_xy = np.array([xt + r_inner * 2, yt])
-                    obstacle_positions.append([float(fallback_xy[0]), float(fallback_xy[1]), zt])
-                    existing_xy.append(fallback_xy)
-
-        return obstacle_positions
-
 
 # ---- 保留旧名称兼容性别名 ---- #
 QuadrantTaskGenerator = ObstacleCountTaskGenerator

@@ -343,8 +343,8 @@ class Scene:
             for _ in range(50):
                 self.step()
         else:
-            print(f"  [初始化] 让新物体稳定 10 步...")
-            for _ in range(10):
+            print(f"  [初始化] 让新物体稳定 20 步...")
+            for _ in range(20):
                 self.step()
 
         # 按环境分组物体
@@ -373,7 +373,7 @@ class Scene:
                 env_target_pos[eid] = torch.mean(positions, dim=0)
         
         gather_steps = 48
-        gather_strength = 7.0  # 降低聚拢力，避免物体挤压后崩飞
+        gather_strength = 7.5  # 降低聚拢力，避免物体挤压后崩飞
         
         for step in range(gather_steps):
             dt = self.sim.get_physics_dt()
@@ -673,7 +673,8 @@ class Scene:
         """
         [功能]: 在指定环境中随机生成杂乱物体
         [输入]: num_objects_range (int/tuple), workspace_limits (Tensor), env_ids (list/None)
-                force_task_config (dict/None): 强制设定的任务配置，包含 target_pos 和 obstacle_positions
+                force_task_config (dict/None): 强制设定的任务配置，可包含 obstacle_count，
+                或包含 target_pos 和 obstacle_positions 以复用已有布局
         [输出]: spawned_objects (List[RigidObject])
         """
         import os, random, torch, numpy as np
@@ -712,6 +713,77 @@ class Scene:
         
         if not available_models or not available_target_models: 
             return []
+
+        def _build_grid_candidates(workspace_limits, target_pos, count):
+            """Build deterministic fallback positions that scale with count."""
+            x_min, x_max = workspace_limits[0, 0].item(), workspace_limits[1, 0].item()
+            y_min, y_max = workspace_limits[0, 1].item(), workspace_limits[1, 1].item()
+            z = target_pos[2]
+            grid_size = max(4, int(np.ceil(np.sqrt(max(count, 1) * 2))))
+            xs = np.linspace(x_min, x_max, grid_size)
+            ys = np.linspace(y_min, y_max, grid_size)
+            candidates = [
+                [round(float(x), 4), round(float(y), 4), z]
+                for x in xs
+                for y in ys
+            ]
+            return sorted(
+                candidates,
+                key=lambda p: (p[0] - target_pos[0]) ** 2 + (p[1] - target_pos[1]) ** 2
+            )
+
+        def _take_grid_candidate(candidates, existing_objects, min_center_dist=0.08):
+            for candidate in candidates:
+                if all(np.linalg.norm(np.array(candidate[:2]) - np.array(pos[:2])) >= min_center_dist
+                       for pos, _ in existing_objects):
+                    candidates.remove(candidate)
+                    return candidate
+            return None
+
+        def _generate_scene_layout(n_obstacles, target_pos):
+            existing_objects = [(target_pos, 0.05)]
+            obstacle_positions = []
+            ws_arg = [[workspace_limits[0, i].item(), workspace_limits[1, i].item()] for i in range(3)]
+            grid_candidates = _build_grid_candidates(
+                workspace_limits, target_pos, n_obstacles
+            )
+
+            for _ in range(n_obstacles):
+                found_pos = self.find_safe_positions(
+                    objects=existing_objects,
+                    candidate_radius=0.05,
+                    workspace=ws_arg,
+                    min_dist=0.08,
+                    max_dist=0.20,
+                    num_positions=1,
+                    max_attempts=2000
+                )
+                if found_pos:
+                    obstacle_positions.append(found_pos)
+                    existing_objects.append((found_pos, 0.06))
+                else:
+                    fallback_pos = _take_grid_candidate(grid_candidates, existing_objects)
+                    if fallback_pos is not None:
+                        obstacle_positions.append(fallback_pos)
+                        existing_objects.append((fallback_pos, 0.04))
+
+            while len(obstacle_positions) < n_obstacles:
+                fallback_pos = _take_grid_candidate(grid_candidates, existing_objects)
+                if fallback_pos is None:
+                    raise RuntimeError(
+                        f"请求生成障碍物 {n_obstacles} 个，"
+                        f"但只生成了 {len(obstacle_positions)} 个障碍物位置"
+                    )
+                obstacle_positions.append(fallback_pos)
+                existing_objects.append((fallback_pos, 0.04))
+
+            if len(obstacle_positions) != n_obstacles:
+                raise RuntimeError(
+                    f"障碍物数量不一致: 期望 {n_obstacles}, "
+                    f"实际 {len(obstacle_positions)}"
+                )
+
+            return obstacle_positions
         
         # === 内部函数:为指定环境生成物体 ===
         def _generate_objects_for_envs(env_ids_to_generate):
@@ -725,9 +797,29 @@ class Scene:
                 # 检查是否已有全局缓存配置（所有环境共用）或传入了强制配置
                 if force_task_config is not None:
                     # 使用传入的 MAML Task 配置
-                    n_obstacles = len(force_task_config['obstacle_positions'])
+                    if 'obstacle_positions' not in force_task_config:
+                        n_obstacles = force_task_config.get('obstacle_count')
+                        if n_obstacles is None:
+                            n_total = num_objects_range if isinstance(num_objects_range, int) else random.randint(*num_objects_range)
+                            n_obstacles = n_total - 1
+                        target_pos = force_task_config.get('target_pos', [0.75, 0.0, 0.06])
+                        force_task_config['target_pos'] = target_pos
+                        force_task_config['obstacle_count'] = n_obstacles
+                        force_task_config['obstacle_positions'] = _generate_scene_layout(
+                            n_obstacles, target_pos
+                        )
+                    else:
+                        n_obstacles = len(force_task_config['obstacle_positions'])
+                        force_task_config['obstacle_count'] = n_obstacles
+                        force_task_config.setdefault('target_pos', [0.75, 0.0, 0.06])
+
                     target_model_name = random.choice(available_target_models)
                     available_obstacle_models = [m for m in available_models if m != target_model_name]
+                    if len(available_obstacle_models) < n_obstacles:
+                        raise RuntimeError(
+                            f"请求生成 {n_obstacles} 个障碍物，"
+                            f"但可用障碍物模型只有 {len(available_obstacle_models)} 个"
+                        )
                     random.shuffle(available_obstacle_models)
                     selected_obstacle_models = available_obstacle_models[:n_obstacles]
                     
@@ -741,58 +833,36 @@ class Scene:
                     # 首次生成全局配置（只生成一次）
                     n_total = num_objects_range if isinstance(num_objects_range, int) else random.randint(*num_objects_range)
                     n_obstacles = n_total - 1
-                    existing_objects = []
-                    
-                    ws_arg = [[workspace_limits[0, i].item(), workspace_limits[1, i].item()] for i in range(3)]
                     
                     # 随机选择模型
                     target_model_name = random.choice(available_target_models)
                     available_obstacle_models = [m for m in available_models if m != target_model_name]
+                    if len(available_obstacle_models) < n_obstacles:
+                        raise RuntimeError(
+                            f"请求生成 {n_obstacles} 个障碍物，"
+                            f"但可用障碍物模型只有 {len(available_obstacle_models)} 个"
+                        )
                     random.shuffle(available_obstacle_models)
                     selected_obstacle_models = available_obstacle_models[:n_obstacles]
                     
                     # 目标物体固定位置
-                    target_pos = [0.7, 0.0, 0.06]
-                    existing_objects.append((target_pos, 0.05))
+                    target_pos = [0.75, 0.0, 0.06]
                     
                     # 为每个障碍物生成固定位置
-                    obstacle_positions = []
-                    for obj_idx in range(n_obstacles):
-                        found_pos = self.find_safe_positions(
-                            objects=existing_objects,
-                            candidate_radius=0.04,
-                            workspace=ws_arg,
-                            min_dist=0.05,
-                            max_dist=0.18,  # 让障碍物分散更开
-                            num_positions=1,
-                            max_attempts=2000
-                        )
-                        if found_pos:
-                            obstacle_positions.append(found_pos)
-                            existing_objects.append((found_pos, 0.06))
-                        else:
-                            # 使用备用位置（8个物体需要7个障碍物位置）
-                            backup_positions = [
-                                [0.85, 0.15, 0.06],
-                                [0.85, -0.15, 0.06],
-                                [0.60, 0.18, 0.06],
-                                [0.60, -0.18, 0.06],
-                                [0.75, 0.25, 0.06],
-                                [0.75, -0.25, 0.06],
-                                [0.55, 0.0, 0.06],
-                            ]
-                            if obj_idx < len(backup_positions):
-                                obstacle_positions.append(backup_positions[obj_idx])
-                                existing_objects.append((backup_positions[obj_idx], 0.04))
+                    obstacle_positions = _generate_scene_layout(n_obstacles, target_pos)
                     
                     # 缓存全局配置（所有环境共用）
                     self._global_spawn_config = {
                         'target_model': target_model_name,
                         'target_pos': target_pos,
-                        'obstacle_models': selected_obstacle_models[:len(obstacle_positions)],
+                        'obstacle_models': selected_obstacle_models,
                         'obstacle_positions': obstacle_positions
                     }
-                    print(f"  [全局缓存] 生成固定配置: 目标={target_model_name}, 障碍物数={len(obstacle_positions)}")
+                    print(
+                        f"  [全局缓存] 生成固定配置: 目标={target_model_name}, "
+                        f"目标数=1, 障碍物数={len(obstacle_positions)}, "
+                        f"总物体数={1 + len(obstacle_positions)}"
+                    )
                     print(f"            位置: 目标={target_pos}, 障碍物={obstacle_positions}")
                 
                 # 所有环境使用同一个全局配置
@@ -924,7 +994,7 @@ class Scene:
                 #         objects=existing_objects,
                 #         candidate_radius=current_radius,
                 #         workspace=ws_arg,
-                #         min_dist=0.05,
+                #         min_dist=0.07,
                 #         max_dist=0.12,
                 #         num_positions=1,
                 #         max_attempts=1000

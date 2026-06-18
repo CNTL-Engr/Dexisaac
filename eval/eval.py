@@ -49,7 +49,7 @@ def parse_args():
 
     # 模型参数
     parser.add_argument('--model_path', type=str,
-                        default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/new_MAML/equi_obj_9/model_meta_200.pth',
+                        default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/OBB_judge/equi_obj_9/model_meta_200.pth',
                         help='模型文件路径')
     parser.add_argument('--use_equivariant', action='store_true', default=True,
                         help='是否使用C4等变网络（默认开启）')
@@ -78,6 +78,13 @@ def parse_args():
     # 日志参数
     parser.add_argument('--log_dir', type=str, default=None,
                         help='日志保存目录（默认保存到 eval/ 目录下）')
+
+    # 调试参数
+    parser.add_argument('--save_depth_debug', action='store_true', default=False,
+                        help='开启判定调试图保存：保存空推前后深度图/差分图，'
+                             '以及目标分离成功判定使用的抓取区域和清空区域可视化。'
+                             '图片保存到以"种子_评估时间"命名的文件夹中'
+                             '（位于本次评估CSV同级目录），默认关闭')
 
     return parser.parse_args()
 
@@ -151,6 +158,26 @@ def run_evaluation_batch(args, seed, env, agent, batch_idx=0, total_batches=1):
     start_time = datetime.now()
     start_time_str = start_time.strftime("%Y%m%d_%H%M%S")
 
+    # ---- 计算本批次日志目录（CSV 与深度调试图片共用） ----
+    if args.num_objects_min == args.num_objects_max:
+        scene_obj_str = str(args.num_objects_max)
+    else:
+        scene_obj_str = f"{args.num_objects_min}-{args.num_objects_max}"
+
+    model_dir_name = Path(args.model_path).parent.name
+    _obj_match = re.search(r'obj_(\d+(?:_\d+)?)', model_dir_name)
+    train_obj_num = _obj_match.group(1) if _obj_match else model_dir_name
+    base_log_dir = args.log_dir if args.log_dir else current_dir
+    log_dir = os.path.join(base_log_dir, train_obj_num)
+
+    # ---- 判定调试模式：以 seed_评估时间 命名的子文件夹（仅在 --save_depth_debug 时开启） ----
+    if getattr(args, 'save_depth_debug', False):
+        env.depth_debug_dir = os.path.join(log_dir, f"{seed}_{start_time_str}")
+        os.makedirs(env.depth_debug_dir, exist_ok=True)
+        print(f"  [判定调试] 空推图与成功判定图将保存到: {env.depth_debug_dir}")
+    else:
+        env.depth_debug_dir = None
+
     # ---- 打印评估配置 ----
     if total_batches > 1:
         print("\n" + "█" * 80)
@@ -187,6 +214,9 @@ def run_evaluation_batch(args, seed, env, agent, batch_idx=0, total_batches=1):
     MAX_RETRIES = 5  # IK失败 / 动作前崩飞时的重试上限
 
     for episode in range(args.n_episodes):
+        # 更新深度调试 episode 序号（用于深度图文件命名）
+        env.depth_debug_episode = episode + 1
+
         # ---- Episode 重试循环（仅对 IK 失败或动作前崩飞重试） ----
         retry_count = 0
         episode_valid = False
@@ -421,30 +451,9 @@ def run_evaluation_batch(args, seed, env, agent, batch_idx=0, total_batches=1):
     # 保存 CSV 日志
     # 命名规则: 场景中的物体个数+随机种子+评估日期时间
     # 存放路径: 以本次评估使用的模型在训练时使用的物体数量命名的文件夹
+    # （scene_obj_str / log_dir 已在批次开头计算，此处直接复用）
     # ============================================================
-
-    # 提取评估时场景中的物体个数
-    if args.num_objects_min == args.num_objects_max:
-        scene_obj_str = str(args.num_objects_max)
-    else:
-        scene_obj_str = f"{args.num_objects_min}-{args.num_objects_max}"
-
     log_filename = f"{scene_obj_str}_{seed}_{start_time_str}.csv"
-
-    # 提取训练时使用的物体数量作为文件夹名
-    model_dir_name = Path(args.model_path).parent.name
-    match = re.search(r'obj_(\d+(?:_\d+)?)', model_dir_name)
-    if match:
-        train_obj_num = match.group(1)
-    else:
-        train_obj_num = model_dir_name
-
-    if args.log_dir:
-        base_log_dir = args.log_dir
-    else:
-        base_log_dir = current_dir  # 默认保存到 eval/ 目录
-
-    log_dir = os.path.join(base_log_dir, train_obj_num)
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, log_filename)
 

@@ -27,24 +27,22 @@ def generate_checkpoint_dir(base_dir, use_equivariant, num_objects_min, num_obje
     [输入]:
         base_dir: 基础目录路径
         use_equivariant: 是否使用等变网络
-        num_objects_min: 最小障碍物数
-        num_objects_max: 最大障碍物数
-        num_targets: 目标物体数量 (默认 1)
+        num_objects_min: 最小总物体数
+        num_objects_max: 最大总物体数
+        num_targets: 保留兼容参数，目录名不再额外叠加
     [输出]: str, 完整的检查点目录路径
 
     [命名规则]:
         - 等变网络(UNet2): equi_obj_X 或 equi_obj_X_Y
         - FC精炼器(消融实验): fc_obj_X 或 fc_obj_X_Y
-        - X, Y 为 障碍物数 + 目标物体数
+        - X, Y 为总物体数
     """
     prefix = "equi" if use_equivariant else "fc"
 
-    total_min = num_objects_min + num_targets
-    total_max = num_objects_max + num_targets
-    if total_min == total_max:
-        obj_suffix = f"obj_{total_min}"
+    if num_objects_min == num_objects_max:
+        obj_suffix = f"obj_{num_objects_min}"
     else:
-        obj_suffix = f"obj_{total_min}_{total_max}"
+        obj_suffix = f"obj_{num_objects_min}_{num_objects_max}"
 
     dir_name = f"{prefix}_{obj_suffix}"
 

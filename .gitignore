@@ -7,6 +7,7 @@ __pycache__/
 .claude/
 # 忽略临时文件和备份
 *~
+dexterous_hand_research_report.md
 # 忽略模型文件
 sam_model/
 *.png

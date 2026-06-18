@@ -57,7 +57,7 @@ def parse_args():
         "--model_path",
         type=str,
         default=os.path.join(
-            repo_dir, "model_results/new_MAML/equi_obj_5_8/model_meta_700.pth"
+            repo_dir, "model_results/OBB_judge/equi_obj_5_8/model_meta_700.pth"
         ),
         help="Meta-trained MAML checkpoint path",
     )
@@ -86,6 +86,25 @@ def parse_args():
         type=str,
         default=None,
         help="Base log directory; default is eval/maml_adapt",
+    )
+    parser.add_argument(
+        "--save_depth_debug",
+        action="store_true",
+        default=False,
+        help="开启空推深度图调试保存：每步将前一帧/后一帧深度图与二值变化掩码"
+        "保存到 以\"种子_评估时间\"命名的文件夹中（位于本次评估CSV同级目录），默认关闭",
+    )
+    parser.add_argument(
+        "--save_adapted_model",
+        action="store_true",
+        default=False,
+        help="Save the inner-loop adapted fast weights as a checkpoint",
+    )
+    parser.add_argument(
+        "--adapted_model_dir",
+        type=str,
+        default=None,
+        help="Directory for adapted checkpoints; default is <log_dir>/adapted_models",
     )
 
     parser.add_argument("--support_episodes", default=2, type=int)
@@ -237,7 +256,53 @@ def detach_fast_weights(fast_weights):
     return {name: value.detach() for name, value in fast_weights.items()}
 
 
-def append_adapt_metadata(log_path, args, support_seed, support_transition_count):
+def save_adapted_checkpoint(
+    args, agent, fast_weights, seed, support_seed, support_transition_count
+):
+    save_dir = args.adapted_model_dir or os.path.join(args.log_dir, "adapted_models")
+    os.makedirs(save_dir, exist_ok=True)
+
+    model_stem = os.path.splitext(os.path.basename(args.model_path))[0]
+    save_path = os.path.join(
+        save_dir,
+        f"{model_stem}_adapted_seed{seed}_support{support_seed}.pth",
+    )
+    adapted_state = {
+        name: value.detach().cpu().clone()
+        for name, value in agent.policy_net.state_dict().items()
+    }
+    adapted_state.update({
+        name: value.detach().cpu().clone()
+        for name, value in fast_weights.items()
+    })
+    torch.save(
+        {
+            "policy_net": adapted_state,
+            "target_net": adapted_state,
+            "adaptation": {
+                "meta_checkpoint": args.model_path,
+                "query_seed": seed,
+                "support_seed": support_seed,
+                "support_episodes": args.support_episodes,
+                "support_epsilon": args.support_epsilon,
+                "support_transitions": support_transition_count,
+                "inner_lr": args.inner_lr,
+                "inner_steps": args.inner_steps,
+                "adapt_batch_size": args.adapt_batch_size,
+                "first_order": args.first_order,
+                "num_objects_min": args.num_objects_min,
+                "num_objects_max": args.num_objects_max,
+            },
+        },
+        save_path,
+    )
+    print(f"  [Adapt] Adapted model saved: {save_path}")
+    return save_path
+
+
+def append_adapt_metadata(
+    log_path, args, support_seed, support_transition_count, adapted_model_path=None
+):
     with open(log_path, "a", newline="", encoding="utf-8") as f:
         f.write("\n")
         f.write("# MAML adaptation config\n")
@@ -250,6 +315,8 @@ def append_adapt_metadata(log_path, args, support_seed, support_transition_count
         f.write(f"adapt_batch_size,{args.adapt_batch_size}\n")
         f.write(f"first_order,{args.first_order}\n")
         f.write("meta_update_called,False\n")
+        if adapted_model_path:
+            f.write(f"adapted_model_path,{adapted_model_path}\n")
 
 
 def main():
@@ -326,6 +393,9 @@ def main():
         print(f"  Seed {seed} ({batch_idx + 1}/{total_batches})")
         print("=" * 80)
 
+        # support 采集阶段不保存深度调试图片，避免污染上一批 query 目录
+        env.depth_debug_dir = None
+
         support_transitions = collect_support_transitions(
             args, env, agent, task_generator, support_seed
         )
@@ -350,6 +420,16 @@ def main():
         fast_weights = detach_fast_weights(fast_weights)
         eval_agent = FastWeightsEvalAgent(agent, fast_weights)
         support_transition_count = len(support_transitions)
+        adapted_model_path = None
+        if args.save_adapted_model:
+            adapted_model_path = save_adapted_checkpoint(
+                args,
+                agent,
+                fast_weights,
+                seed,
+                support_seed,
+                support_transition_count,
+            )
 
         del support_transitions
         torch.cuda.empty_cache()
@@ -364,13 +444,20 @@ def main():
             batch_idx=batch_idx,
             total_batches=total_batches,
         )
-        append_adapt_metadata(log_path, args, support_seed, support_transition_count)
+        append_adapt_metadata(
+            log_path,
+            args,
+            support_seed,
+            support_transition_count,
+            adapted_model_path=adapted_model_path,
+        )
 
         all_results.append(
             {
                 "seed": seed,
                 "success_rate": success_rate,
                 "log_path": log_path,
+                "adapted_model_path": adapted_model_path,
                 "status": "ok",
             }
         )
@@ -389,6 +476,8 @@ def main():
                 f"  Seed {result['seed']:>6d}: "
                 f"success_rate {result['success_rate']:.2f}% | log: {result['log_path']}"
             )
+            if result.get("adapted_model_path"):
+                print(f"            adapted_model: {result['adapted_model_path']}")
         else:
             print(f"  Seed {result['seed']:>6d}: support collection failed")
     if ok_results:
