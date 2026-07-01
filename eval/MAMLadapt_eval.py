@@ -28,6 +28,7 @@ sys.path.insert(0, train_path)
 from scene import Scene
 from env_wrapper import PushEnv
 from maml_dqn import MAMLDQNAgent, ObstacleCountTaskGenerator
+from project_paths import resolve_project_path
 
 
 def _load_module(module_name, path):
@@ -56,9 +57,7 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default=os.path.join(
-            repo_dir, "model_results/OBB_judge/equi_obj_5_8/model_meta_700.pth"
-        ),
+        default="model_results/OBB_judge/equi_obj_5_8/model_meta_700.pth",
         help="Meta-trained MAML checkpoint path",
     )
     parser.add_argument(
@@ -321,6 +320,11 @@ def append_adapt_metadata(
 
 def main():
     args = parse_args()
+    args.model_path = resolve_project_path(args.model_path)
+    if args.log_dir is not None:
+        args.log_dir = resolve_project_path(args.log_dir)
+    if args.adapted_model_dir is not None:
+        args.adapted_model_dir = resolve_project_path(args.adapted_model_dir)
 
     if args.num_objects_min < 1 or args.num_objects_max < args.num_objects_min:
         print("ERROR: invalid object-count range")

@@ -4,10 +4,12 @@ import matplotlib.pyplot as plt
 import cv2
 import sys
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+from project_paths import resolve_project_path
 
 class SAMWrapper:
-    def __init__(self, checkpoint_path="/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/sam_model/sam_vit_h_4b8939.pth", model_type="vit_h", device="cuda"):
+    def __init__(self, checkpoint_path="sam_model/sam_vit_h_4b8939.pth", model_type="vit_h", device="cuda"):
         self.device = device
+        checkpoint_path = resolve_project_path(checkpoint_path)
         self.sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
         self.sam.to(device=self.device)
         self.predictor = SamPredictor(self.sam)
@@ -84,7 +86,7 @@ def show_anns(anns):
 
 if __name__ == "__main__":
     # Load image
-    image = cv2.imread('/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/src/image.png')
+    image = cv2.imread(resolve_project_path('src/image.png'))
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
     # Initialize Wrapper (defaults)

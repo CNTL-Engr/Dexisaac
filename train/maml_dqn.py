@@ -34,6 +34,7 @@ if src_path not in sys.path:
 
 from pushnet import EquivariantPushNet
 from pushnet_cnn import CNNPushNet
+from project_paths import resolve_project_path
 from escnn import nn as enn
 
 
@@ -73,8 +74,8 @@ class ObstacleCountTaskGenerator:
     }
 
     # 默认模型文件夹路径
-    _DEFAULT_OBSTACLE_DIR = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata/meshdata_CH"
-    _DEFAULT_TARGET_DIR = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata/meshdata_target"
+    _DEFAULT_OBSTACLE_DIR = "meshdata/meshdata_CH"
+    _DEFAULT_TARGET_DIR = "meshdata/meshdata_target"
 
     def __init__(self, num_tasks=None, base_obstacle_count=None, radius=0.21, min_dist=0.07, max_attempts=1000, model_dirs=None):
         """
@@ -102,8 +103,8 @@ class ObstacleCountTaskGenerator:
         self._task_model_dirs = {}
         for tid in range(self.NUM_TASKS):
             self._task_model_dirs[tid] = {
-                'obstacle_dir': self._DEFAULT_OBSTACLE_DIR,
-                'target_dir': self._DEFAULT_TARGET_DIR,
+                'obstacle_dir': resolve_project_path(self._DEFAULT_OBSTACLE_DIR),
+                'target_dir': resolve_project_path(self._DEFAULT_TARGET_DIR),
             }
 
         # 如果用户传入了自定义配置，合并覆盖默认值
@@ -202,9 +203,9 @@ class ObstacleCountTaskGenerator:
                       f"超出范围 [0, {self.NUM_TASKS - 1}]，已忽略")
                 continue
             if 'obstacle_dir' in dirs:
-                self._task_model_dirs[tid]['obstacle_dir'] = dirs['obstacle_dir']
+                self._task_model_dirs[tid]['obstacle_dir'] = resolve_project_path(dirs['obstacle_dir'])
             if 'target_dir' in dirs:
-                self._task_model_dirs[tid]['target_dir'] = dirs['target_dir']
+                self._task_model_dirs[tid]['target_dir'] = resolve_project_path(dirs['target_dir'])
 
     def get_model_dirs(self, task_id):
         """

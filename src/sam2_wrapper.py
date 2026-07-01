@@ -7,13 +7,15 @@ import os
 # Ensure sam2 is in path if not installed globally (it is installed as 'SAM-2' package but imports as 'sam2')
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
+from project_paths import resolve_project_path
 
 class SAM2Wrapper:
     def __init__(self, 
-                 checkpoint_path="/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/sam_model/sam2.1_hiera_large.pt", 
+                 checkpoint_path="sam_model/sam2.1_hiera_large.pt", 
                  config_file="configs/sam2.1/sam2.1_hiera_l.yaml",
                  device="cuda"):
         self.device = device
+        checkpoint_path = resolve_project_path(checkpoint_path)
         
         # build_sam2 expects config file path relative to sam2 root or absolute. 
         # Since we have the absolute path, we can pass it directly or handle it.

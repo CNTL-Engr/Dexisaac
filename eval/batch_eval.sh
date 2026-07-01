@@ -25,8 +25,8 @@ NUM_OBJECTS_MAX=5
 # 每轮最大步数
 EPISODE_MAX_STEPS=8
 
-# 模型路径
-MODEL_PATH="/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/equi_obj_9/model_final.pth"
+# 模型路径（相对于 Dexisaac 项目根）
+MODEL_PATH="model_results/equi_obj_9/model_final.pth"
 
 # 是否使用等变网络（默认开启）
 USE_EQUIVARIANT="--use_equivariant"
@@ -36,8 +36,11 @@ LOG_DIR=""
 
 # ==================== 执行逻辑 ====================
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 EVAL_SCRIPT="${SCRIPT_DIR}/eval.py"
+
+cd "${PROJECT_ROOT}"
 
 echo "========================================================================"
 echo "  批量评估 - 共 ${NUM_EVALS} 次"

@@ -21,6 +21,7 @@ meshdata_3obs/
 meshdata_4obs/
 meshdata_5obs/
 meshdata_6obs/
+meshdata_use.zip
 # 忽略原始模型数据文件
 meshdata*/
 *imgs*/

@@ -1,6 +1,7 @@
 import argparse
 from typing import Optional, TYPE_CHECKING
 from config import initialize_app, configure_simulation
+from project_paths import external_mesh_path, resolve_project_path
 
 if TYPE_CHECKING:
     from robot import Robot
@@ -18,7 +19,7 @@ class Scene:
         """
         self.num_envs = num_envs
         self.env_spacing = env_spacing
-        self.usd_path = "/home/disk_18T/user/kjy/equi/mesh/env.usd"
+        self.usd_path = external_mesh_path("env.usd")
         
         # 记录关键路径
         self.env_paths = {
@@ -662,7 +663,7 @@ class Scene:
                 env_id = self._get_env_id_from_prim_path(obj.cfg.prim_path)
                 if env_id in env_ids_to_delete:
                     objects_to_remove.append(obj)
-        
+
         for obj in objects_to_remove:
             prim_path = obj.cfg.prim_path
             if stage.GetPrimAtPath(prim_path).IsValid():
@@ -697,14 +698,14 @@ class Scene:
         # Meshdata 数据集路径
         # [MAML] 如果 force_task_config 指定了模型文件夹，优先使用
         if force_task_config is not None and 'obstacle_model_dir' in force_task_config:
-            ycb_root = force_task_config['obstacle_model_dir']
+            ycb_root = resolve_project_path(force_task_config['obstacle_model_dir'])
         else:
-            ycb_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata/meshdata_CH"
+            ycb_root = resolve_project_path("meshdata/meshdata_CH")
         
         if force_task_config is not None and 'target_model_dir' in force_task_config:
-            ycb_target_root = force_task_config['target_model_dir']
+            ycb_target_root = resolve_project_path(force_task_config['target_model_dir'])
         else:
-            ycb_target_root = "/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/meshdata/meshdata_target"
+            ycb_target_root = resolve_project_path("meshdata/meshdata_target")
         
         # 查找所有包含 textured.usd 的模型
         get_models = lambda root: [d for d in os.listdir(root) if os.path.exists(os.path.join(root, d, "textured.usd"))] if os.path.exists(root) else []
@@ -1084,7 +1085,7 @@ class Scene:
                 # print(f"\n✓ 所有环境生成成功!\\n")
                 pending_envs.clear()
                 break
-            
+
             # 5. 更新尝试次数并过滤
             envs_to_retry = []
             for eid in failed_envs:

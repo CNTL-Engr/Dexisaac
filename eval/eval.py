@@ -39,6 +39,7 @@ sys.path.insert(0, train_path)
 from scene import Scene
 from agent import DQNAgent
 from env_wrapper import PushEnv
+from project_paths import resolve_project_path
 
 
 # ============================================================
@@ -49,7 +50,7 @@ def parse_args():
 
     # 模型参数
     parser.add_argument('--model_path', type=str,
-                        default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/OBB_judge/equi_obj_9/model_meta_200.pth',
+                        default='model_results/OBB_judge/equi_obj_9/model_meta_200.pth',
                         help='模型文件路径')
     parser.add_argument('--use_equivariant', action='store_true', default=True,
                         help='是否使用C4等变网络（默认开启）')
@@ -500,6 +501,9 @@ def run_evaluation_batch(args, seed, env, agent, batch_idx=0, total_batches=1):
 # ============================================================
 def main():
     args = parse_args()
+    args.model_path = resolve_project_path(args.model_path)
+    if args.log_dir is not None:
+        args.log_dir = resolve_project_path(args.log_dir)
 
     # ---- 参数校验 ----
     if args.n_batches <= 0:

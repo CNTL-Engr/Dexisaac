@@ -21,9 +21,15 @@ sys.path.insert(0, src_path)
 sys.path.insert(0, train_path)
 
 from scene import Scene
+from agent import DQNAgent
 from maml_dqn import MAMLDQNAgent, ObstacleCountTaskGenerator
 from env_wrapper import PushEnv
-from utils import compute_epsilon, generate_checkpoint_dir
+from project_paths import resolve_project_path
+from utils import print_training_log, compute_epsilon, generate_checkpoint_dir
+
+
+DEFAULT_MODEL_PATH = 'model_results/PCA_judge/equi_obj_5_9/model_meta_100.pth'
+DEFAULT_CHECKPOINT_BASE_DIR = 'model_results/PCA_judge'
 
 
 def parse_args():
@@ -36,6 +42,12 @@ def parse_args():
     parser.add_argument('--episode_max_steps', default=8, type=int, help='每个 episode 最大步数')
     parser.add_argument('--headless', action='store_true', default=True)
     parser.add_argument('--no-headless', dest='headless', default=False, action='store_false')
+    parser.add_argument(
+        '--algorithm',
+        default='maml',
+        choices=['maml', 'dqn'],
+        help='训练方式: maml 使用当前 MAML-DQN；dqn 使用普通 DQN replay-buffer 训练'
+    )
 
     # MAML 参数
     parser.add_argument('--n_meta_iterations', default=700, type=int, help='元迭代总数')
@@ -65,23 +77,28 @@ def parse_args():
     parser.add_argument('--first_order', action='store_true', default=True, help='使用 FOMAML')
     parser.add_argument('--no_first_order', dest='first_order', action='store_false', help='使用完整 MAML (二阶)')
 
-    # DQN 参数
+    # DQN/共享参数
     parser.add_argument('--learning_rate', default=1e-4, type=float, help='外循环学习率')
     parser.add_argument('--gamma', default=0.99, type=float, help='折扣因子')
     parser.add_argument('--epsilon_start', default=0.8, type=float, help='初始探索率')
     parser.add_argument('--epsilon_end', default=0.08, type=float, help='最终探索率')
-    parser.add_argument('--epsilon_decay_steps', default=550, type=int, help='探索衰减步数 (meta-iterations)')
+    parser.add_argument('--epsilon_decay_steps', default=550, type=int, help='探索衰减步数')
     parser.add_argument('--epsilon_query', default=0.0, type=float, help='Query 阶段探索率，默认 0 表示完全 exploit')
-    parser.add_argument('--target_update_freq', default=5, type=int, help='目标网络更新频率 (meta-iterations)')
+    parser.add_argument('--target_update_freq', default=5, type=int, help='目标网络更新频率')
+    parser.add_argument('--n_episodes', default=888, type=int, help='DQN 总训练轮数')
+    parser.add_argument('--batch_size', default=16, type=int, help='DQN 训练批大小')
+    parser.add_argument('--replay_buffer_size', default=12000, type=int, help='DQN 经验池大小')
+    parser.add_argument('--min_buffer_size', default=16, type=int, help='DQN 日志显示的开始训练最小经验数')
 
     # 保存参数
     parser.add_argument('--save_every', default=50, type=int, help='保存频率 (meta-iterations)')
-    parser.add_argument('--checkpoint_base_dir', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/PCA_judge', type=str)
+    parser.add_argument('--checkpoint_base_dir', default=DEFAULT_CHECKPOINT_BASE_DIR, type=str)
     parser.add_argument('--save_intermediate', action='store_true', default=True)
 
     # 模型加载参数
     parser.add_argument('--load_model', action='store_true', default=True)
-    parser.add_argument('--model_path', default='/home/disk_18T/user/kjy/equi/IsaacLab/scripts/Dexisaac_MAML/model_results/PCA_judge/equi_obj_5_9/model_meta_100.pth', type=str)
+    parser.add_argument('--no-load_model', '--no-load-model', dest='load_model', action='store_false')
+    parser.add_argument('--model_path', default=DEFAULT_MODEL_PATH, type=str)
     parser.add_argument('--resume_meta_iter', default=0, type=int, help='从指定 meta-iteration 恢复')
     parser.add_argument('--resume_path', default='', type=str, help='显式指定恢复训练 checkpoint 路径')
     parser.add_argument('--use_equivariant', action='store_true', default=True)
@@ -277,30 +294,8 @@ def run_episode(env, agent, force_task_config, epsilon, max_steps, fast_weights=
     return transitions
 
 
-def main():
-    args = parse_args()
-
-    try:
-        fixed_task_ids = validate_fixed_plus_random_args(args)
-    except ValueError as exc:
-        print(f"错误: {exc}")
-        os._exit(1)
-
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
-
-    args.checkpoint_dir = generate_checkpoint_dir(
-        args.checkpoint_base_dir, args.use_equivariant,
-        args.num_objects_min, args.num_objects_max
-    )
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-
-    if "--enable_cameras" not in sys.argv:
-        sys.argv.append("--enable_cameras")
-    if args.headless and "--headless" not in sys.argv:
-        sys.argv.append("--headless")
-
+def run_maml_training(args):
+    fixed_task_ids = validate_fixed_plus_random_args(args)
     print("=" * 80)
     network_type = "C4等变网络" if args.use_equivariant else "普通CNN网络"
     print(f"MAML-DQN 训练 ({network_type})")
@@ -546,6 +541,387 @@ def main():
     print(f"\n{'='*80}")
     print(f"训练完成! 最终模型: {final_path}")
     print(f"{'='*80}")
+
+
+def load_dqn_model_if_requested(agent, args):
+    if not args.load_model:
+        return
+    if getattr(args, 'model_path_is_default', False):
+        print("[Agent] DQN 分支跳过默认 MAML model_path；如需加载 DQN checkpoint，请显式传 --model_path")
+        return
+    if args.model_path and os.path.exists(args.model_path):
+        print(f"[Agent] 加载预训练模型: {args.model_path}")
+        checkpoint = torch.load(args.model_path, map_location=args.device)
+        if 'policy_net' in checkpoint:
+            agent.policy_net.load_state_dict(checkpoint['policy_net'])
+            agent.target_net.load_state_dict(checkpoint['target_net'])
+            if 'optimizer' in checkpoint:
+                agent.optimizer.load_state_dict(checkpoint['optimizer'])
+            print("[Agent] 模型加载成功 (checkpoint 格式)")
+        else:
+            agent.policy_net.load_state_dict(checkpoint)
+            agent.target_net.load_state_dict(agent.policy_net.state_dict())
+            print("[Agent] 模型加载成功 (权重格式)")
+    else:
+        print(f"⚠ 警告: 指定加载模型但路径无效或不存在: {args.model_path}")
+        print("  将从头开始训练")
+
+
+def run_dqn_training(args):
+    print("=" * 80)
+    network_type = "C4等变网络" if args.use_equivariant else "普通CNN网络"
+    print(f"PushNet 强化学习训练（{network_type}）")
+    print("=" * 80)
+    print(f"Q 网络: {'EquivariantPushNet (C4等变)' if args.use_equivariant else 'CNNPushNet (非等变)'}")
+    print("算法: DQN")
+    print(f"环境数量: {args.num_envs}")
+    print(f"Episode 总数: {args.n_episodes}")
+    print(f"设备: {args.device}")
+    print(f"无界面模式 (Headless): {args.headless}")
+    print("=" * 80)
+
+    print("\n[1/4] 初始化场景...")
+    scene = Scene(description="DQN Training", num_envs=args.num_envs)
+
+    print("[2/4] 创建环境...")
+    env = PushEnv(scene=scene, args=args)
+    env.max_steps_per_episode = args.episode_max_steps
+
+    print("[3/4] 创建 DQN Agent...")
+    agent = DQNAgent(
+        device=args.device,
+        lr=args.learning_rate,
+        gamma=args.gamma,
+        buffer_capacity=args.replay_buffer_size,
+        use_equivariant=args.use_equivariant
+    )
+    load_dqn_model_if_requested(agent, args)
+
+    print("[4/4] 开始训练...")
+    print("=" * 80)
+
+    global_step = 0
+    episode_rewards_history = []
+    train_loss_buffer = []
+    action_counts = [0] * 8
+    action_explore_counts = [0] * 8
+    action_exploit_counts = [0] * 8
+    success_count = 0
+    ik_failed_count = 0
+    valid_task_count = 0
+    recent_100_env_results = deque(maxlen=100)
+
+    csv_path = os.path.join(args.checkpoint_dir, "training_log.csv")
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    csv_file = open(csv_path, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['episode', 'step', 'loss', 'reward'])
+    print(f"[数据记录] 训练日志将保存到: {csv_path}")
+
+    invalid_actions_list = [[] for _ in range(args.num_envs)]
+
+    for episode in range(args.n_episodes):
+        episode_retry_count = 0
+        max_episode_retries = 5
+        episode_valid = False
+        step = 0
+        episode_reward = 0.0
+        env_rewards = [0.0] * args.num_envs
+        infos = []
+
+        while not episode_valid and episode_retry_count < max_episode_retries:
+            episode_retry_count += 1
+            ik_failed_this_episode = False
+            episode_experiences = []
+
+            if episode_retry_count == 1:
+                print("\n" + "=" * 80)
+                print(f"  Episode {episode+1}/{args.n_episodes}")
+                print("=" * 80)
+            else:
+                print(f"\n  [重试 {episode_retry_count}/{max_episode_retries}] Episode {episode+1}")
+
+            states, spawned_objects = env.reset()
+            print("  [环境状态] 生成成功")
+            torch.cuda.empty_cache()
+
+            episode_reward = 0
+            env_rewards = [0.0] * args.num_envs
+
+            for step in range(args.episode_max_steps):
+                pre_check_exploded = False
+                for env_idx in range(args.num_envs):
+                    _, out_reason, is_exploded = env._check_out_of_bounds(env_idx, spawned_objects)
+                    if is_exploded:
+                        print(f"\n  ⚠ [动作前检测] Env {env_idx} 物体已崩飞: {out_reason}")
+                        pre_check_exploded = True
+                        ik_failed_this_episode = True
+                        break
+
+                if pre_check_exploded:
+                    print(f"  ✗ Episode {episode+1} 因动作前检测到崩飞而终止...")
+                    episode_experiences.clear()
+                    break
+
+                epsilon = compute_epsilon(
+                    global_step, args.epsilon_start,
+                    args.epsilon_end, args.epsilon_decay_steps
+                )
+
+                actions = []
+                strategy_types = []
+                debug_print = (episode % 10 == 0) and (step == 0)
+
+                for env_idx in range(args.num_envs):
+                    state = states[env_idx:env_idx+1]
+                    action, strategy_type = agent.select_action(
+                        state, epsilon,
+                        invalid_actions=invalid_actions_list[env_idx],
+                        env_idx=env_idx,
+                        debug=debug_print
+                    )
+                    actions.append(action)
+                    strategy_types.append(strategy_type)
+
+                    action_counts[action] += 1
+                    if strategy_type == 'explore':
+                        action_explore_counts[action] += 1
+                    else:
+                        action_exploit_counts[action] += 1
+
+                torch.cuda.empty_cache()
+
+                try:
+                    next_states, rewards, dones, infos = env.step(actions, spawned_objects)
+                except Exception as exc:
+                    print("\n!!! 错误：env.step() 执行失败 !!!")
+                    print(f"错误类型: {type(exc).__name__}")
+                    print(f"错误信息: {str(exc)}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+
+                for env_idx in range(args.num_envs):
+                    if infos[env_idx].get('ik_failed', False):
+                        ik_failed_this_episode = True
+                        ik_failed_count += 1
+                        print(f"\n  ⚠ IK解算失败 (Env {env_idx})! 本Episode将终止并重试...")
+                        break
+                    if infos[env_idx].get('is_exploded', False):
+                        ik_failed_this_episode = True
+                        print(f"\n  ⚠ 崩飞 (Env {env_idx}: {infos[env_idx].get('out_reason', 'unknown')})! 本Episode将终止并重试...")
+                        break
+
+                if ik_failed_this_episode:
+                    episode_experiences.clear()
+                    break
+
+                for env_idx in range(args.num_envs):
+                    is_ik_failed = infos[env_idx].get('ik_failed', False)
+                    is_exploded = infos[env_idx].get('is_exploded', False)
+
+                    if not is_ik_failed and not is_exploded:
+                        valid_task_count += 1
+                        if infos[env_idx].get('success', False):
+                            success_count += 1
+
+                    if dones[env_idx]:
+                        invalid_actions_list[env_idx] = []
+
+                    if infos[env_idx].get('is_exploded', False):
+                        print(f"  [跳过崩飞经验] Env {env_idx}: {infos[env_idx].get('out_reason', 'unknown')}")
+                        continue
+
+                    if infos[env_idx].get('empty_push', False):
+                        if actions[env_idx] not in invalid_actions_list[env_idx]:
+                            invalid_actions_list[env_idx].append(actions[env_idx])
+                    else:
+                        invalid_actions_list[env_idx] = []
+
+                    state_cpu = states[env_idx].cpu()
+                    next_state_cpu = next_states[env_idx].cpu()
+                    if state_cpu.dtype != torch.uint8:
+                        state_cpu = (state_cpu * 255).to(torch.uint8)
+                    if next_state_cpu.dtype != torch.uint8:
+                        next_state_cpu = (next_state_cpu * 255).to(torch.uint8)
+
+                    episode_experiences.append({
+                        'state': state_cpu,
+                        'action': actions[env_idx],
+                        'reward': rewards[env_idx].item(),
+                        'next_state': next_state_cpu,
+                        'done': dones[env_idx].item()
+                    })
+
+                step_loss = None
+                buffer_size = len(agent.replay_buffer)
+                if buffer_size >= 4:
+                    dynamic_batch_size = min(buffer_size, args.batch_size)
+                    step_loss = agent.train_step(batch_size=dynamic_batch_size)
+                    if step_loss is not None:
+                        train_loss_buffer.append(step_loss)
+                    torch.cuda.empty_cache()
+
+                temp_step = global_step + step + 1
+                if temp_step % args.target_update_freq == 0:
+                    print(f"\n{'='*40}")
+                    print(f"[目标网络更新] 预估step={temp_step}")
+                    print(f"{'='*40}")
+                    agent.update_target_network()
+                    print(f"{'='*40}\n")
+
+                print_training_log(
+                    'step',
+                    step=step+1,
+                    max_steps=args.episode_max_steps,
+                    infos=infos,
+                    step_loss=step_loss,
+                    epsilon=epsilon,
+                    agent=agent,
+                    min_buffer_size=args.min_buffer_size,
+                    rewards=rewards,
+                    actions=actions,
+                    invalid_actions_list=invalid_actions_list,
+                    dones=dones,
+                    strategy_types=strategy_types
+                )
+
+                del states
+                torch.cuda.empty_cache()
+
+                states = next_states
+                episode_reward += rewards.sum().item()
+                for env_idx in range(args.num_envs):
+                    env_rewards[env_idx] += rewards[env_idx].item()
+
+                if dones.all():
+                    print("\n  >> 所有环境已完成")
+                    break
+
+            if ik_failed_this_episode:
+                print(f"  ✗ Episode {episode+1} 因IK失败而无效，正在重试...")
+                episode_experiences.clear()
+                torch.cuda.empty_cache()
+                gc.collect()
+                continue
+
+            episode_valid = True
+            for exp in episode_experiences:
+                agent.store_transition(
+                    state=exp['state'],
+                    action=exp['action'],
+                    reward=exp['reward'],
+                    next_state=exp['next_state'],
+                    done=exp['done']
+                )
+            episode_experiences.clear()
+
+        if not episode_valid:
+            print(f"\n  ⚠ Episode {episode+1} 重试 {max_episode_retries} 次后仍失败，跳过此回合")
+
+        if episode_valid and infos:
+            for env_idx in range(args.num_envs):
+                if env_idx < len(infos):
+                    recent_100_env_results.append(infos[env_idx].get('success', False))
+
+        states = None
+        rewards = None
+        dones = None
+        infos = None
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        episode_rewards_history.append(episode_reward)
+
+        if episode_valid:
+            global_step += step + 1
+            episode_avg_loss = np.mean(train_loss_buffer[-step-1:]) if train_loss_buffer else 0.0
+            csv_writer.writerow([episode + 1, global_step, episode_avg_loss, episode_reward])
+            csv_file.flush()
+
+        print_training_log(
+            'episode',
+            episode=episode+1,
+            total_steps=step+1,
+            max_steps=args.episode_max_steps,
+            total_reward=episode_reward,
+            buffer_size=len(agent.replay_buffer),
+            buffer_capacity=args.replay_buffer_size,
+            num_envs=args.num_envs,
+            env_rewards=env_rewards,
+            action_counts=action_counts,
+            action_explore_counts=action_explore_counts,
+            action_exploit_counts=action_exploit_counts,
+            success_count=success_count,
+            valid_task_count=valid_task_count,
+            ik_failed_count=ik_failed_count,
+            recent_100_env_results=recent_100_env_results
+        )
+
+        if (episode + 1) % args.save_every == 0:
+            avg_reward_10 = np.mean(episode_rewards_history[-10:])
+            print_training_log(
+                'progress',
+                episode=episode+1,
+                total_episodes=args.n_episodes,
+                avg_reward_10=avg_reward_10,
+                global_step=global_step
+            )
+            if args.save_intermediate:
+                csv_file.flush()
+                print(f"✓ 训练数据已刷新到: {csv_path}")
+
+        if args.save_intermediate and (episode + 1) % args.save_every == 0:
+            save_path = os.path.join(args.checkpoint_dir, f"model_episode_{episode+1}.pth")
+            agent.save(save_path)
+            print(f"\n✓ 中间模型已保存: {save_path}\n")
+
+    final_path = os.path.join(args.checkpoint_dir, "model_final.pth")
+    agent.save(final_path)
+    csv_file.close()
+    print(f"\n✓ 训练数据已保存到: {csv_path}")
+
+    print("\n" + "=" * 80)
+    print(f"训练完成！最终模型已保存到: {final_path}")
+    print("=" * 80)
+
+    scene.simulation_app.close()
+
+
+def main():
+    args = parse_args()
+    args.model_path_is_default = args.model_path == DEFAULT_MODEL_PATH
+    args.checkpoint_base_dir = resolve_project_path(args.checkpoint_base_dir)
+    args.model_path = resolve_project_path(args.model_path)
+    args.resume_path = resolve_project_path(args.resume_path)
+
+    try:
+        if args.algorithm == 'maml':
+            validate_fixed_plus_random_args(args)
+    except ValueError as exc:
+        print(f"错误: {exc}")
+        os._exit(1)
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+    args.checkpoint_dir = generate_checkpoint_dir(
+        args.checkpoint_base_dir, args.use_equivariant,
+        args.num_objects_min, args.num_objects_max
+    )
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    if "--enable_cameras" not in sys.argv:
+        sys.argv.append("--enable_cameras")
+    if args.headless and "--headless" not in sys.argv:
+        sys.argv.append("--headless")
+
+    if args.algorithm == 'dqn':
+        run_dqn_training(args)
+    else:
+        run_maml_training(args)
+
     os._exit(0)
 
 
