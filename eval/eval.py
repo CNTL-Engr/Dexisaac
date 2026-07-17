@@ -40,6 +40,7 @@ from scene import Scene
 from agent import DQNAgent
 from env_wrapper import PushEnv
 from project_paths import resolve_project_path
+from utils import format_contact_action, format_push_effectiveness
 
 
 # ============================================================
@@ -65,6 +66,18 @@ def parse_args():
                         help='多个随机种子，每个种子独立运行一批评估（与 --seed 互斥）')
     parser.add_argument('--episode_max_steps', default=8, type=int,
                         help='每个 episode 最大步数')
+    parser.add_argument('--empty_push_displacement_threshold', default=0.01, type=float,
+                        help='有效推动所需的目标物体物理质心 XY 位移阈值（米，严格大于）')
+    parser.add_argument('--empty_push_force_threshold', default=1.0, type=float,
+                        help='有效推动所需的任一夹爪手指峰值接触力阈值（N，严格大于）')
+    parser.add_argument('--explosion_linear_speed_threshold', default=1.0, type=float,
+                        help='动力学崩飞的物体三维总线速度阈值（m/s，严格大于）')
+    parser.add_argument('--explosion_linear_acceleration_threshold', default=50.0, type=float,
+                        help='动力学崩飞的物体三维总线加速度阈值（m/s^2，严格大于）')
+    parser.add_argument('--explosion_abnormal_steps_threshold', default=5, type=int,
+                        help='判为崩飞所需的连续线速度异常物理步数')
+    parser.add_argument('--explosion_acceleration_speed_step_window', default=5,
+                        type=int, help='加速度异常步到连续速度异常区间允许的最大物理步距')
 
     # 环境参数
     parser.add_argument('--num_objects_min', default=9, type=int, help='最小物体数')
@@ -82,8 +95,8 @@ def parse_args():
 
     # 调试参数
     parser.add_argument('--save_depth_debug', action='store_true', default=False,
-                        help='开启判定调试图保存：保存空推前后深度图/差分图，'
-                             '以及目标分离成功判定使用的抓取区域和清空区域可视化。'
+                        help='开启判定调试图保存：保存目标分离成功判定使用的抓取区域'
+                             '和清空区域可视化；物理空推判定不再生成深度差分图。'
                              '图片保存到以"种子_评估时间"命名的文件夹中'
                              '（位于本次评估CSV同级目录），默认关闭')
 
@@ -107,6 +120,8 @@ def print_step_log(step, max_steps, action_idx, invalid_actions, info,
         direction_deg = (action_idx - 4) * 90
 
     print(f"  动作选择: {action_type} (Index {action_idx}, 方向{direction_deg}°)")
+    if not info.get('already_done', False):
+        print(format_contact_action(info))
 
     # 屏蔽动作
     if invalid_actions:
@@ -129,13 +144,15 @@ def print_step_log(step, max_steps, action_idx, invalid_actions, info,
           f"({detail_str})")
 
     # 空推判定
-    is_empty = info.get('empty_push', False)
-    emp = info.get('empty_metrics', {})
-    change_val = int(emp.get('change_value', 0))
-    total_px = emp.get('total_pixels', 1)
-    change_ratio = emp.get('change_ratio', 0.0)
-    print(f"  空推判定: {'⚠ 空推' if is_empty else '✓ 有效'} "
-          f"(变化: {change_val}/{total_px} ({change_ratio:.2f}%))")
+    # [旧深度图日志保留，已停用]
+    # is_empty = info.get('empty_push', False)
+    # emp = info.get('empty_metrics', {})
+    # change_val = int(emp.get('change_value', 0))
+    # total_px = emp.get('total_pixels', 1)
+    # change_ratio = emp.get('change_ratio', 0.0)
+    # print(f"  空推判定: {'⚠ 空推' if is_empty else '✓ 有效'} "
+    #       f"(变化: {change_val}/{total_px} ({change_ratio:.2f}%))")
+    print(f"  {format_push_effectiveness(info)}")
 
     # 崩飞判定
     if is_exploded_step:
@@ -171,11 +188,11 @@ def run_evaluation_batch(args, seed, env, agent, batch_idx=0, total_batches=1):
     base_log_dir = args.log_dir if args.log_dir else current_dir
     log_dir = os.path.join(base_log_dir, train_obj_num)
 
-    # ---- 判定调试模式：以 seed_评估时间 命名的子文件夹（仅在 --save_depth_debug 时开启） ----
+    # ---- 成功判定图片调试：以 seed_评估时间 命名的子文件夹 ----
     if getattr(args, 'save_depth_debug', False):
         env.depth_debug_dir = os.path.join(log_dir, f"{seed}_{start_time_str}")
         os.makedirs(env.depth_debug_dir, exist_ok=True)
-        print(f"  [判定调试] 空推图与成功判定图将保存到: {env.depth_debug_dir}")
+        print(f"  [判定调试] 成功判定图将保存到: {env.depth_debug_dir}")
     else:
         env.depth_debug_dir = None
 
@@ -341,13 +358,15 @@ def run_evaluation_batch(args, seed, env, agent, batch_idx=0, total_batches=1):
                         is_exploded_step=info.get('is_exploded', False)
                     )
 
-                    # 更新无效动作列表 (IAS)
+                    if info.get('empty_push', False):
+                        episode_empty_push_count += 1
+
+                    # 更新无效动作列表 (IAS)。空推现为终止失败，不带到下一 episode。
                     if dones[env_idx]:
                         invalid_actions[env_idx] = []
                     elif info.get('empty_push', False):
                         if actions[env_idx] not in invalid_actions[env_idx]:
                             invalid_actions[env_idx].append(actions[env_idx])
-                        episode_empty_push_count += 1
                     else:
                         invalid_actions[env_idx] = []
 
@@ -359,6 +378,12 @@ def run_evaluation_batch(args, seed, env, agent, batch_idx=0, total_batches=1):
                         if not episode_fail_reason:
                             episode_fail_reason = \
                                 f"出界: {info.get('out_reason', 'unknown')}"
+                    elif info.get('illegal_contact', False) and not episode_fail_reason:
+                        episode_fail_reason = "非法接触"
+                    elif info.get('empty_push', False) and not episode_fail_reason:
+                        episode_fail_reason = "空推"
+                    elif info.get('max_steps_exceeded', False) and not episode_fail_reason:
+                        episode_fail_reason = "超过最大步数"
 
                 # 崩飞后终止
                 if step_exploded:
@@ -467,6 +492,14 @@ def run_evaluation_batch(args, seed, env, agent, batch_idx=0, total_batches=1):
         writer.writerow(['seed', seed])
         writer.writerow(['n_episodes', args.n_episodes])
         writer.writerow(['episode_max_steps', args.episode_max_steps])
+        writer.writerow(['explosion_linear_speed_threshold_m_s',
+                         args.explosion_linear_speed_threshold])
+        writer.writerow(['explosion_linear_acceleration_threshold_m_s2',
+                         args.explosion_linear_acceleration_threshold])
+        writer.writerow(['explosion_abnormal_steps_threshold',
+                         args.explosion_abnormal_steps_threshold])
+        writer.writerow(['explosion_acceleration_speed_step_window',
+                         args.explosion_acceleration_speed_step_window])
         writer.writerow(['num_objects_range',
                          f'{args.num_objects_min}-{args.num_objects_max}'])
         writer.writerow(['start_time', start_time_str])

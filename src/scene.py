@@ -1,7 +1,7 @@
 import argparse
 from typing import Optional, TYPE_CHECKING
 from config import initialize_app, configure_simulation
-from project_paths import external_mesh_path, resolve_project_path
+from project_paths import project_path, resolve_project_path
 
 if TYPE_CHECKING:
     from robot import Robot
@@ -10,7 +10,7 @@ class Scene:
     """
     管理仿真场景和应用程序生命周期的类。
     """
-    def __init__(self, description="Isaac Lab Scene", num_envs=1, env_spacing=2.0):
+    def __init__(self, description="Isaac Lab Scene", num_envs=1, env_spacing=3.0):
         """
         [功能]: 初始化 Scene 类。
         [输入]: description (str): 应用程序的描述信息。
@@ -19,7 +19,12 @@ class Scene:
         """
         self.num_envs = num_envs
         self.env_spacing = env_spacing
-        self.usd_path = external_mesh_path("env.usd")
+        # 动态 USD 拓扑更新期间禁止任何物理步或 tensor 数据访问。该标志在
+        # STOP 前置位，只在 reset + contact-view rebuild 全部成功后清除。
+        self._topology_update_pending = False
+        # 静态覆盖层在 stage 打开前为左右 inner/outer finger 补齐 ContactReportAPI。
+        # 原始 mesh/env.usd 不修改；运行期间也不再改 finger schema，保护 instance proto。
+        self.usd_path = project_path("assets", "env_contact_report.usda")
         
         # 记录关键路径
         self.env_paths = {
@@ -65,13 +70,26 @@ class Scene:
         from pxr import Usd, UsdGeom, Gf
         import math
 
-        # 如果只有一个环境，直接打开舞台
+        # 先在空 Stage 上初始化 SimulationContext/Fabric，再组合场景资产。
+        # 原顺序是 open_stage(env) -> SimulationContext；4.5 会复用 env 自带的
+        # /physicsScene，并对 Hydra 已填充的整套材质 Sprim 做二次销毁/重建，
+        # 从而触发 _MarkSprimDirty changeTracker 竞态。
+        self.stage_utils.create_new_stage()
+        self.sim = configure_simulation(self.app_launcher)
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            raise RuntimeError("创建空 USD Stage 失败。")
+
+        world = stage.DefinePrim("/World", "Xform")
+        stage.SetDefaultPrim(world)
+
         if self.num_envs <= 1:
-            self.stage_utils.open_stage(self.usd_path)
+            if not world.GetReferences().AddReference(self.usd_path):
+                raise RuntimeError(f"场景 USD 引用失败: {self.usd_path}")
+            if not stage.GetPrimAtPath("/World/Scene").IsValid():
+                raise RuntimeError(f"场景 USD 缺少 /World/Scene: {self.usd_path}")
         else:
-            self.stage_utils.create_new_stage()
             grid_width = int(math.ceil(math.sqrt(self.num_envs)))
-            stage = omni.usd.get_context().get_stage()
             
             for i in range(self.num_envs):
                 x, y = (i // grid_width) * self.env_spacing, (i % grid_width) * self.env_spacing
@@ -82,9 +100,6 @@ class Scene:
                 if i > 0 and (g := stage.GetPrimAtPath(f"{env_path}/{self.env_paths['Ground']}")).IsValid():
                     g.SetActive(False)
 
-        # 配置仿真上下文（但不启动）
-        self.sim = configure_simulation(self.app_launcher)
-        
         print("[Scene] Stage loaded. Ready for camera creation.")
 
     def start_simulation(self):
@@ -94,7 +109,25 @@ class Scene:
         """
         if not self.sim:
             raise RuntimeError("Must call load_stage() before start_simulation()")
-        
+
+        # === 四指接触追踪：PhysX 成对接触数据（Isaac Lab 2.1.1 兼容） ===
+        # 不创建 Isaac Lab ContactSensor，也不在运行期修改 instanceable 几何。
+        # 环境变量 DISABLE_GRIPPER_CONTACT=1 可完全关闭接触追踪。
+        import os as _os
+        if _os.environ.get("DISABLE_GRIPPER_CONTACT", "0") == "1":
+            self.contact_tracker = None
+            print("[Scene] DISABLE_GRIPPER_CONTACT=1 → 跳过夹爪接触追踪")
+        else:
+            from physx_contact_report import PhysXContactReportTracker
+            self.contact_tracker = PhysXContactReportTracker(
+                gripper_prim_path=self.gripper_prim_path,
+                num_envs=self.num_envs,
+            )
+
+        # 在创建 Camera/RenderProduct 前只验证静态 API；此调用不写 USD stage。
+        if self.contact_tracker is not None:
+            self.contact_tracker.activate_api()
+
         # === 为每个场景创建独立相机 ===
         from camera import Camera
         exclude_paths = [self.robot_prim_path, self.gripper_prim_path]
@@ -117,10 +150,10 @@ class Scene:
             self.cameras.append(camera)
         
         print(f"[Scene] Created {len(self.cameras)} camera(s)")
-        
+
         # 启动物理引擎
         self.sim.reset()
-        
+
         # === 为每个场景创建独立Robot ===
         from robot import Robot
         self.robots = []
@@ -206,14 +239,26 @@ class Scene:
         """
         执行一步仿真。
         """
-        if self.robot:
-            self.robot.write()
-            
-        if self.sim:
-            self.sim.step()
-            
-        if self.robot and self.sim:
-            self.robot.update(self.sim.get_physics_dt())
+        if self._topology_update_pending:
+            raise RuntimeError(
+                "USD 拓扑更新尚未完成，禁止在 tensor handles 重建前执行物理步。"
+            )
+        if not self.sim:
+            return
+
+        # 单环境和多环境使用同一条控制生命周期。每个 Robot 都是
+        # 一个独立的单实例 Articulation，因此不能只更新单环境便捷引用
+        # self.robot。这里统一 write -> 一次物理步 -> update，调用方不得
+        # 再用伪造的 dt 重复更新 asset 时间戳。
+        robots = list(getattr(self, "robots", None) or [])
+        for robot in robots:
+            robot.write()
+
+        self.sim.step()
+
+        physics_dt = float(self.sim.get_physics_dt())
+        for robot in robots:
+            robot.update(physics_dt)
 
     def is_playing(self):
         """
@@ -233,6 +278,14 @@ class Scene:
         """
         return self.simulation_app.is_running()
 
+    def close(self):
+        """兼容 Isaac Lab 2.1.1，在无桌面服务器上安全关闭仿真。"""
+        if self.sim is not None:
+            # STOP 事件触发后继续 render 会让 Replicator 的关闭流程死循环。
+            self.sim._disable_app_control_on_stop_handle = True
+        # 本项目只读取 Camera annotator，不运行需要等待写完的 Replicator writer。
+        self.simulation_app.close(wait_for_replicator=False)
+
     def load_usd_object(self, usd_path, init_pos, init_rot=None, name="object", prim_path_pattern=None):
         """
         [功能]: 从 USD 文件加载刚体对象到模拟器中。
@@ -247,8 +300,21 @@ class Scene:
         [输出]: RigidObject: 创建的刚体对象实例。
         """
         import torch
+        import os
         from isaaclab.assets import RigidObject, RigidObjectCfg
         import isaaclab.sim as sim_utils
+
+        # 071 是唯一“引用根为容器、真实刚体在 Root/textured”的模型。
+        # 静态 wrapper 直接把真实刚体作为 default prim；保留质量和视觉内容，
+        # 用离线低面数凸包替代异常高面数碰撞网格，使根路径可作为精确 filter。
+        is_model_071 = os.path.basename(os.path.dirname(usd_path)) == "071"
+        if is_model_071:
+            wrapper_name = (
+                "ycb_071_target_flat.usda"
+                if "meshdata_target" in usd_path
+                else "ycb_071_ch_flat.usda"
+            )
+            usd_path = project_path("assets", wrapper_name)
 
         # 自动推断 prim_path_pattern 如果未提供
         if prim_path_pattern is None:
@@ -274,8 +340,13 @@ class Scene:
                     rigid_body_enabled=True,
                     disable_gravity=False,
                 ),
-                collision_props=sim_utils.CollisionPropertiesCfg(
-                    collision_enabled=True
+                # 071 wrapper 已在低面数 contact_collision 上静态配置碰撞。
+                # 此处若递归覆盖 collision_props，UsdFileCfg 会重新给 152 万面
+                # 的视觉网格应用 CollisionAPI，导致 PhysX 在 reset 时长时间烹饪。
+                collision_props=(
+                    None
+                    if is_model_071
+                    else sim_utils.CollisionPropertiesCfg(collision_enabled=True)
                 ),
                 mass_props=sim_utils.MassPropertiesCfg(mass=1),
             ),
@@ -325,25 +396,32 @@ class Scene:
         obj = self.load_usd_object(usd_path, pos, quat, name=name, prim_path_pattern=prim_path)
         return obj
 
-    def _gather_objects(self, spawned_objects, reset_sim=True):
+    def _gather_objects(self, spawned_objects, reset_sim=True, views_ready=False):
         """
         [功能]: 聚集所有已生成的物体。
         [输入]: spawned_objects (list): 已生成的物体列表。
                 reset_sim (bool, optional): 是否重置模拟器。默认为 True。
+                views_ready (bool, optional): 调用方是否已经完成注册、reset 和
+                    tensor-view 重建。仅用于多环境失败重试路径。
         """
         import torch
-        if not spawned_objects or self.sim is None: 
+        if not spawned_objects or self.sim is None:
             return
-        
+
+        # 注册物体根/刚体路径，随后把 PhysX 成对接触列精确映射到三位模型 ID。
+        tracker = getattr(self, 'contact_tracker', None)
+        if tracker is not None and not views_ready:
+            tracker.register_objects(spawned_objects)
+
         if reset_sim:
-            self.sim.reset()
-            if self.robots:
-                for robot in self.robots:
-                    robot.reset()
-            
+            self._reset_simulation_and_rebuild_views("物体生成")
+
             for _ in range(50):
                 self.step()
         else:
+            # 重试路径在调用本方法前已经执行过 sim.reset()。
+            if tracker is not None and not views_ready:
+                tracker.rebuild_tensor_views()
             print(f"  [初始化] 让新物体稳定 20 步...")
             for _ in range(20):
                 self.step()
@@ -645,6 +723,67 @@ class Scene:
         
         return env_results
 
+    def _begin_topology_update(self, object_count):
+        """停止物理并使所有 Isaac Lab/tensor handles 进入可安全删除状态。"""
+        if object_count <= 0:
+            return
+        if self.sim is None:
+            raise RuntimeError("无法开始 USD 拓扑更新：SimulationContext 尚未创建。")
+
+        self._topology_update_pending = True
+        # Isaac Lab 在非 terminal 启动方式下会响应 STOP 并进入渲染等待；拓扑
+        # 事务必须临时禁止该行为，直到 PLAY/reset 恢复全部物理 handles。
+        self.sim._disable_app_control_on_stop_handle = True
+        try:
+            if not self.sim.is_stopped():
+                self.sim.stop()
+            if not self.sim.is_stopped():
+                raise RuntimeError("timeline.stop() 返回后仿真仍未进入 stopped 状态。")
+        except Exception as exc:
+            self._topology_update_pending = False
+            self.sim._disable_app_control_on_stop_handle = False
+            raise RuntimeError(
+                f"停止物理以删除 {object_count} 个 USD 物体失败。"
+            ) from exc
+
+    def _reset_simulation_and_rebuild_views(self, phase):
+        """统一 PLAY/reset Isaac Lab handles，并重建全部 GPU 接触视图。"""
+        if self.sim is None:
+            raise RuntimeError(f"{phase} reset 失败：SimulationContext 尚未创建。")
+
+        try:
+            self.sim.reset()
+        except Exception as exc:
+            # 保持 pending=True；调用方不得在半初始化状态继续 step/tensor 查询。
+            self._topology_update_pending = True
+            raise RuntimeError(f"{phase} 后重建 PhysX/Isaac Lab handles 失败。") from exc
+
+        if not self.sim.is_playing():
+            self._topology_update_pending = True
+            raise RuntimeError(f"{phase} reset 返回后 timeline 未处于 playing 状态。")
+
+        try:
+            if self.robots:
+                for robot in self.robots:
+                    robot.reset()
+
+            tracker = getattr(self, "contact_tracker", None)
+            if tracker is not None:
+                rebuilt_count = tracker.rebuild_tensor_views()
+                if rebuilt_count != self.num_envs:
+                    raise RuntimeError(
+                        "GPU 接触视图重建数量错误："
+                        f"期望 {self.num_envs}，实际 {rebuilt_count}。"
+                    )
+        except Exception as exc:
+            self._topology_update_pending = True
+            raise RuntimeError(f"{phase} 后重建 robot/contact tensor views 失败。") from exc
+
+        self._topology_update_pending = False
+        # SimulationContext.reset() 正常返回时也会清除此标志；这里显式恢复，
+        # 兼容已经 stopped 后直接 PLAY 的路径。
+        self.sim._disable_app_control_on_stop_handle = False
+
     def _delete_objects(self, spawned_objects, env_ids_to_delete=None):
         """
         [功能]: 删除指定环境的物体
@@ -664,10 +803,26 @@ class Scene:
                 if env_id in env_ids_to_delete:
                     objects_to_remove.append(obj)
 
+        if not objects_to_remove:
+            return
+
+        # STOP 会通过 Isaac Lab 正式 timeline 回调使 RigidObject/Articulation
+        # handles 失效。必须在它完成后，才能删除这些 handles 曾引用的 prim。
+        self._begin_topology_update(len(objects_to_remove))
+
+        tracker = getattr(self, "contact_tracker", None)
+        if tracker is not None:
+            tracker.unregister_objects(objects_to_remove)
+
         for obj in objects_to_remove:
             prim_path = obj.cfg.prim_path
-            if stage.GetPrimAtPath(prim_path).IsValid():
-                stage.RemovePrim(prim_path)
+            try:
+                if stage.GetPrimAtPath(prim_path).IsValid():
+                    stage.RemovePrim(prim_path)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"物理停止后删除 USD prim 失败: {prim_path}"
+                ) from exc
             spawned_objects.remove(obj)
 
     def create_clutter_environment(self, num_objects_range, workspace_limits=None, env_ids=None, force_task_config=None):
@@ -1053,7 +1208,12 @@ class Scene:
             iteration += 1
             
             # 1. 为待处理环境生成物体
-            new_objects = _generate_objects_for_envs(pending_envs)
+            try:
+                new_objects = _generate_objects_for_envs(pending_envs)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"为环境 {sorted(pending_envs)} 生成 USD 物体失败。"
+                ) from exc
             all_spawned_objects.extend(new_objects)
             
             # 2. 聚拢
@@ -1064,10 +1224,18 @@ class Scene:
                 self._gather_objects(all_spawned_objects, reset_sim=True)
             else:
                 successful_envs = [eid for eid in range(self.num_envs) if eid not in pending_envs]
-                self.sim.reset()
+                tracker = getattr(self, 'contact_tracker', None)
+                if tracker is not None:
+                    # 先注册新路径，使统一 rebuild 能一次覆盖成功环境和重试环境。
+                    tracker.register_objects(new_objects)
+                self._reset_simulation_and_rebuild_views("环境生成重试")
                 if successful_envs:
                     self._restore_cached_positions(all_spawned_objects, successful_envs)
-                self._gather_objects(new_objects, reset_sim=False)
+                self._gather_objects(
+                    new_objects,
+                    reset_sim=False,
+                    views_ready=True,
+                )
             
             # 3. 向量化验证
             env_results = self._check_objects_in_workspace(all_spawned_objects, workspace_limits)

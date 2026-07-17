@@ -72,6 +72,30 @@ def parse_args():
     parser.add_argument("--seed", default=None, type=int, help="Single query seed")
     parser.add_argument("--seeds", default=None, type=int, nargs="+", help="Query seeds")
     parser.add_argument("--episode_max_steps", default=8, type=int)
+    parser.add_argument(
+        "--empty_push_displacement_threshold", default=0.01, type=float,
+        help="有效推动所需的目标物体物理质心 XY 位移阈值（米，严格大于）",
+    )
+    parser.add_argument(
+        "--empty_push_force_threshold", default=1.0, type=float,
+        help="有效推动所需的任一夹爪手指峰值接触力阈值（N，严格大于）",
+    )
+    parser.add_argument(
+        "--explosion_linear_speed_threshold", default=1.0, type=float,
+        help="动力学崩飞的物体三维总线速度阈值（m/s，严格大于）",
+    )
+    parser.add_argument(
+        "--explosion_linear_acceleration_threshold", default=50.0, type=float,
+        help="动力学崩飞的物体三维总线加速度阈值（m/s^2，严格大于）",
+    )
+    parser.add_argument(
+        "--explosion_abnormal_steps_threshold", default=5, type=int,
+        help="判为崩飞所需的连续线速度异常物理步数",
+    )
+    parser.add_argument(
+        "--explosion_acceleration_speed_step_window", default=5, type=int,
+        help="加速度异常步到连续速度异常区间允许的最大物理步距",
+    )
 
     parser.add_argument("--num_objects_min", default=9, type=int, help="Minimum total objects")
     parser.add_argument("--num_objects_max", default=9, type=int, help="Maximum total objects")
@@ -79,6 +103,14 @@ def parse_args():
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--no-headless", dest="headless", action="store_false")
     parser.add_argument("--device", type=str, default="cuda")
+    # isaaclab.sh 只负责把该参数转交给 Python。这里先接收但不消费，后续
+    # Scene.initialize_app() 会从 sys.argv 再解析并交给 AppLauncher/Kit。
+    parser.add_argument(
+        "--kit_args",
+        type=str,
+        default="",
+        help="Arguments forwarded verbatim by AppLauncher to Omniverse Kit",
+    )
 
     parser.add_argument(
         "--log_dir",
@@ -90,8 +122,7 @@ def parse_args():
         "--save_depth_debug",
         action="store_true",
         default=False,
-        help="开启空推深度图调试保存：每步将前一帧/后一帧深度图与二值变化掩码"
-        "保存到 以\"种子_评估时间\"命名的文件夹中（位于本次评估CSV同级目录），默认关闭",
+        help="开启成功判定调试图保存；物理空推判定不再生成深度差分图，默认关闭",
     )
     parser.add_argument(
         "--save_adapted_model",

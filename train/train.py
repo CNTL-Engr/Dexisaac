@@ -25,10 +25,16 @@ from agent import DQNAgent
 from maml_dqn import MAMLDQNAgent, ObstacleCountTaskGenerator
 from env_wrapper import PushEnv
 from project_paths import resolve_project_path
-from utils import print_training_log, compute_epsilon, generate_checkpoint_dir
+from utils import (
+    format_contact_action,
+    format_push_effectiveness,
+    print_training_log,
+    compute_epsilon,
+    generate_checkpoint_dir,
+)
 
 
-DEFAULT_MODEL_PATH = 'model_results/PCA_judge/equi_obj_5_9/model_meta_100.pth'
+DEFAULT_MODEL_PATH = 'model_results/PCA_judge/equi_obj_5_9/'
 DEFAULT_CHECKPOINT_BASE_DIR = 'model_results/PCA_judge'
 
 
@@ -37,9 +43,33 @@ def parse_args():
 
     # 环境参数
     parser.add_argument('--num_envs', default=1, type=int, help='并行环境数量')
-    parser.add_argument('--num_objects_min', default=5, type=int, help='最小总物体数 (目标物体1个 + 障碍物)')
-    parser.add_argument('--num_objects_max', default=10, type=int, help='最大总物体数 (目标物体1个 + 障碍物)')
+    parser.add_argument('--num_objects_min', default=4, type=int, help='最小总物体数 (目标物体1个 + 障碍物)')
+    parser.add_argument('--num_objects_max', default=7, type=int, help='最大总物体数 (目标物体1个 + 障碍物)')
     parser.add_argument('--episode_max_steps', default=8, type=int, help='每个 episode 最大步数')
+    parser.add_argument(
+        '--empty_push_displacement_threshold', default=0.01, type=float,
+        help='有效推动所需的目标物体物理质心 XY 位移阈值（米，严格大于）'
+    )
+    parser.add_argument(
+        '--empty_push_force_threshold', default=1.0, type=float,
+        help='有效推动所需的任一夹爪手指对目标物体的峰值接触力阈值（N，严格大于）'
+    )
+    parser.add_argument(
+        '--explosion_linear_speed_threshold', default=1.0, type=float,
+        help='动力学崩飞的物体三维总线速度阈值（m/s，严格大于）'
+    )
+    parser.add_argument(
+        '--explosion_linear_acceleration_threshold', default=50.0, type=float,
+        help='动力学崩飞的物体三维总线加速度阈值（m/s^2，严格大于）'
+    )
+    parser.add_argument(
+        '--explosion_abnormal_steps_threshold', default=5, type=int,
+        help='判为崩飞所需的连续线速度异常物理步数'
+    )
+    parser.add_argument(
+        '--explosion_acceleration_speed_step_window', default=5, type=int,
+        help='加速度异常步到连续速度异常区间允许的最大物理步距'
+    )
     parser.add_argument('--headless', action='store_true', default=True)
     parser.add_argument('--no-headless', dest='headless', default=False, action='store_false')
     parser.add_argument(
@@ -252,6 +282,9 @@ def run_episode(env, agent, force_task_config, epsilon, max_steps, fast_weights=
         for env_idx in range(env.num_envs):
             reward_val = rewards[env_idx].item()
             info = infos[env_idx]
+            if not info.get('already_done', False):
+                print(f"        {format_contact_action(info)}")
+                print(f"        {format_push_effectiveness(info)}")
             parts = []
             if 'reward_breakdown' in info:
                 for k, v in info['reward_breakdown'].items():
@@ -267,8 +300,7 @@ def run_episode(env, agent, force_task_config, epsilon, max_steps, fast_weights=
         for env_idx in range(env.num_envs):
             if dones[env_idx]:
                 invalid_actions_list[env_idx] = []
-
-            if infos[env_idx].get('empty_push', False):
+            elif infos[env_idx].get('empty_push', False):
                 if actions[env_idx] not in invalid_actions_list[env_idx]:
                     invalid_actions_list[env_idx].append(actions[env_idx])
             else:
@@ -725,14 +757,13 @@ def run_dqn_training(args):
                         if infos[env_idx].get('success', False):
                             success_count += 1
 
-                    if dones[env_idx]:
-                        invalid_actions_list[env_idx] = []
-
                     if infos[env_idx].get('is_exploded', False):
                         print(f"  [跳过崩飞经验] Env {env_idx}: {infos[env_idx].get('out_reason', 'unknown')}")
                         continue
 
-                    if infos[env_idx].get('empty_push', False):
+                    if dones[env_idx]:
+                        invalid_actions_list[env_idx] = []
+                    elif infos[env_idx].get('empty_push', False):
                         if actions[env_idx] not in invalid_actions_list[env_idx]:
                             invalid_actions_list[env_idx].append(actions[env_idx])
                     else:
@@ -885,7 +916,7 @@ def run_dqn_training(args):
     print(f"训练完成！最终模型已保存到: {final_path}")
     print("=" * 80)
 
-    scene.simulation_app.close()
+    scene.close()
 
 
 def main():

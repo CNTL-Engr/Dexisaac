@@ -4,6 +4,17 @@ import cv2
 # from camera import Camera  # Camera now passed from outside
 # from sam2_wrapper import SAM2Wrapper  # Commented out SAM2
 
+# ====== 固定尺度深度归一化常数 (由 inspect_sim.py 实测) ======
+# 台面深度 (相机到桌子台面的距离, m)。inspect_sim.py --check table_depth 实测 = 1.23。
+# 灰度 0 对应台面; 物体越高(深度越小)灰度越大。
+DEPTH_TABLE_M = 1.23
+# 满量程高度 (m): 物体池最长边 0.274, 平躺入场实际高度多在 0.03-0.11,
+# 取 0.18 覆盖平躺+边立的现实高度并高于 push_z 上限(0.15), 高过此值饱和到 255。
+DEPTH_MAX_HEIGHT_M = 0.18
+# 近平面深度 = 台面深度 - 满量程高度。深度 clip 到 [DEPTH_NEAR, DEPTH_TABLE]。
+DEPTH_NEAR_M = DEPTH_TABLE_M - DEPTH_MAX_HEIGHT_M  # 1.05
+
+
 class State:
     def __init__(self, camera=None, env_idx=0, env_origin=(0.0, 0.0)):
         """
@@ -234,13 +245,16 @@ class State:
 
         # Normalize depth
         if normalize_depth:
-            
-            d_min, d_max = resized_depth.min(), resized_depth.max()
-            if d_max - d_min > 1e-3:
-                resized_depth = ((resized_depth - d_min) / (d_max - d_min) * 255.0).astype(np.uint8)
-            else:
-                resized_depth[:] = 127 # Middle gray if flat
-                resized_depth = resized_depth.astype(np.uint8)
+            # [固定尺度归一化] 不再每帧 min-max (参考系会随场景内容漂移,
+            # 导致同一物体高度在不同帧灰度不同)。改用实测的固定物理常数:
+            #   台面 (DEPTH_TABLE_M=1.23) → 灰度 0
+            #   台面上方 DEPTH_MAX_HEIGHT_M(0.18m) → 灰度 255
+            # 这样灰度 = 台面以上绝对高度的固定编码, 跨帧一致, 且不破坏 C4 等变。
+            # 高于 0.18m 的部分饱和到 255 (语义: "肯定很高"), 远处/台面/pad 收敛到 0。
+            depth_f = resized_depth.astype(np.float32)
+            depth_clipped = np.clip(depth_f, DEPTH_NEAR_M, DEPTH_TABLE_M)
+            norm = (DEPTH_TABLE_M - depth_clipped) / (DEPTH_TABLE_M - DEPTH_NEAR_M)
+            resized_depth = (norm * 255.0).astype(np.uint8)
 
         return resized_rgb, resized_depth, resized_seg
 

@@ -4,6 +4,7 @@
 import cv2
 import numpy as np
 import torch
+from pathlib import Path
 
 
 PPM = 320.0 / 1.0  # pixels per meter
@@ -266,6 +267,79 @@ def _find_dominant_obstacle_mask(seg_map, target_mask, global_mask, center_u, ce
     return dominant_mask, int(dominant_seg_id)
 
 
+def _prim_path_for_seg_id(seg_id, seg_map, state, spawned_objects):
+    """
+    [点1] 把一个 seg_id 翻成对应物体的 prim_path。
+    做法: 把每个物体中心投影到 seg 像素读 id, 命中 seg_id 的那个物体即是。
+    返回 prim_path (str) 或 None (未找到, 如 seg_id=-1 或背景)。
+    """
+    if seg_id is None or seg_id == -1 or seg_map is None or not spawned_objects:
+        return None
+    # 首选 Isaac Lab 2.1.1 已提供的 instance-id 元信息。它直接给出 ID 对应的
+    # prim 标签/路径，堆叠时不会因“物体中心像素被上层物体遮挡”而错配。
+    try:
+        camera_data = state.camera.camera.data
+        info_all = camera_data.info
+        info = info_all[0] if isinstance(info_all, list) else info_all
+        seg_info = (info or {}).get("instance_id_segmentation_fast", {})
+        labels = seg_info.get("idToLabels", {})
+        label = labels.get(str(int(seg_id)), labels.get(int(seg_id)))
+
+        def _strings(value):
+            if isinstance(value, str):
+                yield value
+            elif isinstance(value, dict):
+                for item in value.values():
+                    yield from _strings(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    yield from _strings(item)
+
+        label_strings = list(_strings(label))
+        for obj in spawned_objects:
+            root = obj.cfg.prim_path.rstrip('/')
+            if any(root in text for text in label_strings):
+                return root
+    except Exception:
+        pass
+
+    # 兼容兜底：保留原来的中心投影方法。
+    h, w = seg_map.shape
+    for obj in spawned_objects:
+        try:
+            pos_3d = obj.data.root_pos_w[0]
+            if hasattr(pos_3d, "cpu"):
+                pos_3d = pos_3d.cpu().numpy()
+            u, v = state.world_to_pixel([pos_3d[0], pos_3d[1]])
+            u_c = int(np.clip(u, 0, w - 1))
+            v_c = int(np.clip(v, 0, h - 1))
+            if int(seg_map[v_c, u_c]) == int(seg_id):
+                return obj.cfg.prim_path
+        except Exception:
+            continue
+    return None
+
+
+def _model_id_for_prim_path(prim_path, spawned_objects):
+    """从匹配物体 USD 的父文件夹读取三位模型 ID。"""
+    if not prim_path:
+        return None
+    for obj in spawned_objects or []:
+        try:
+            if obj.cfg.prim_path.rstrip('/') != prim_path.rstrip('/'):
+                continue
+            model_id = Path(str(obj.cfg.spawn.usd_path)).parent.name
+            if len(model_id) == 3 and model_id.isdigit():
+                return model_id
+            leaf = prim_path.rsplit('/', 1)[-1]
+            candidate = leaf[len('Target_'):] if leaf.startswith('Target_') else leaf.split('_', 2)[-1]
+            if len(candidate) == 3 and candidate.isdigit():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
 def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_objects):
     """
     根据离散动作索引计算推点和推动方向
@@ -365,6 +439,9 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
     center_u, center_v = target_center
     center_depth = depth_map[center_v, center_u]
 
+    # [点1] 记录该动作"第一下应该碰到的物体" seg id, 供 env_wrapper 的接触判定使用。
+    #   推目标 (0-3): intended = target_id
+    #   推障碍 (4-7): intended = 选中的 dominant 障碍 id (无则 -1)
     if action_idx <= 3:
         # ===== 推目标物体 =====
         direction_idx = action_idx
@@ -372,6 +449,7 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
         push_u, push_v, push_z, _ = _compute_safe_push_from_mask(
             depth_map, target_mask, center_u, center_v, push_angle_deg, center_depth
         )
+        intended_seg_id = int(target_id)
     else:
         # ===== 推障碍物 =====
         direction_idx = action_idx - 4
@@ -409,7 +487,8 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
             push_u, push_v, push_z, _ = _compute_legacy_obstacle_push(
                 depth_map, center_u, center_v, center_depth
             )
-    
+        intended_seg_id = int(dominant_seg_id)  # -1 表示未选到障碍 (走 legacy fallback)
+
     # 转换为世界坐标
     # [Fix] 坐标系修复：根据State.world_to_pixel的定义
     # u = 160 + int((y_local - 0.0) * PPM)    -> u 对应 World Y
@@ -427,5 +506,28 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
     push_y = y_local + env_offset_y
     
     push_point = torch.tensor([push_x, push_y, push_z], dtype=torch.float32, device='cuda')
-    
-    return push_point, direction_idx
+
+    # [点1] 接触判定所需信息: 该动作"意图碰到的物体" prim_path + 动作类型。
+    #   env_wrapper 用 PhysX 成对接触列拿到“第一下实际碰到的刚体 prim_path”，与此比对。
+    #   intended_prim_path=None 表示未选到明确物体 (如推障碍时没选到 dominant, 走 legacy)。
+    if action_idx <= 3:
+        # 推目标不需要经过分割 ID 反查；Target_* 对象引用就是唯一意图实体。
+        intended_prim_path = next(
+            (
+                obj.cfg.prim_path
+                for obj in spawned_objects
+                if obj.cfg.prim_path.rsplit('/', 1)[-1].startswith('Target_')
+            ),
+            None,
+        )
+    else:
+        intended_prim_path = _prim_path_for_seg_id(
+            intended_seg_id, seg_map, state, spawned_objects
+        )
+    contact_spec = {
+        'intended_prim_path': intended_prim_path,
+        'intended_model_id': _model_id_for_prim_path(intended_prim_path, spawned_objects),
+        'kind': 'target' if action_idx <= 3 else 'obstacle',
+    }
+
+    return push_point, direction_idx, contact_spec

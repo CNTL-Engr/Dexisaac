@@ -6,6 +6,43 @@
 import os
 
 
+def format_contact_action(info):
+    """按统一格式展示一次动作的意图模型与 PhysX 首次实际接触模型。"""
+    intended = info.get('contact_intended_model_id') or '未知'
+    status = info.get('contact_status', 'unavailable')
+    actual = info.get('contact_actual_model_id')
+
+    if status == 'illegal':
+        return f'准备推"{intended}"  实际碰撞"{actual or "未知"}"'
+
+    if status in ('no_contact', 'unavailable'):
+        actual = '未接触'
+    else:
+        actual = actual or '未知'
+    return f'准备推"{intended}"  实际推"{actual}"'
+
+
+def format_push_effectiveness(info):
+    """展示物理质心位移与意图物体峰值接触力的空推判定。"""
+    is_empty = info.get('empty_push', False)
+    metrics = info.get('empty_metrics') or {}
+    if not metrics:
+        return f"推动判定: {'⚠ 空推' if is_empty else '跳过'} (当前优先级分支未执行空推检测)"
+
+    displacement = float(metrics.get('displacement_m', 0.0))
+    displacement_threshold = float(metrics.get('displacement_threshold_m', 0.01))
+    peak_force = float(metrics.get('peak_contact_force_n', 0.0))
+    force_threshold = float(metrics.get('force_threshold_n', 1.0))
+    displacement_mark = '✓' if metrics.get('displacement_ok', False) else '×'
+    force_mark = '✓' if metrics.get('force_ok', False) else '×'
+    reason = metrics.get('reason', 'unknown')
+    return (
+        f"推动判定: {'⚠ 空推' if is_empty else '✓ 有效'} "
+        f"(质心XY位移={displacement:.4f}m/{displacement_threshold:.4f}m {displacement_mark}, "
+        f"峰值力={peak_force:.3f}N/{force_threshold:.3f}N {force_mark}, 原因={reason})"
+    )
+
+
 def compute_epsilon(step, epsilon_start, epsilon_end, epsilon_decay_steps):
     """
     [功能]: 计算当前的epsilon值（线性衰减）
@@ -124,6 +161,9 @@ def print_training_log(mode, **kwargs):
             # B. 判定细节
             if i < len(infos):
                 env_info = infos[i]
+
+                if not env_info.get('already_done', False):
+                    print(format_contact_action(env_info))
                 
                 # 出界
                 is_out = env_info.get('out_of_bounds', False)
@@ -137,9 +177,13 @@ def print_training_log(mode, **kwargs):
                 print(f"  成功判定: {'✓ 成功' if success else '× 未成功'} ({detail_str})")
                 
                 # 空推
-                is_empty = env_info.get('empty_push', False)
-                emp = env_info.get('empty_metrics', {})
-                print(f"  推动判定: {'⚠ 空推' if is_empty else '✓ 有效'} (变化: {int(emp.get('change_value',0))}/{emp.get('total_pixels',1)} ({emp.get('change_ratio',0.0):.2f}%))")
+                # [旧深度图日志保留，已停用]
+                # is_empty = env_info.get('empty_push', False)
+                # emp = env_info.get('empty_metrics', {})
+                # print(f"  推动判定: {'⚠ 空推' if is_empty else '✓ 有效'} "
+                #       f"(变化: {int(emp.get('change_value', 0))}/"
+                #       f"{emp.get('total_pixels', 1)} ({emp.get('change_ratio', 0.0):.2f}%))")
+                print(f"  {format_push_effectiveness(env_info)}")
                 
                 print("-" * 8)
                 

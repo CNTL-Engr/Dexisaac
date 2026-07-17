@@ -129,14 +129,16 @@ class Robot:
         
         self.push_primitive = PushActionPrimitive(device=self.device, lift_height=0.1)
         
-        # [FailSafe] Track environments where IK failed
-        self.ik_fail_indices = set()
+        # 当前架构为“每个 Scene 环境一个 Robot”，且每个 Robot 的
+        # Articulation 只有一个局部实例（索引始终为 0）。用布尔状态避免
+        # 把 articulation 局部索引与全局 env_idx 混用。
+        self.ik_failed = False
         
     def reset_ik_status(self):
         """
         重置 IK 失败状态。在每一轮 step 开始时调用。
         """
-        self.ik_fail_indices.clear()
+        self.ik_failed = False
 
     def initialize(self):
         """
@@ -255,6 +257,7 @@ class Robot:
             print(f"[Robot] ⚠ 未能更新任何环境的PrismaticJoint参数")
         
     def reset(self):
+        self.reset_ik_status()
         if hasattr(self, 'default_joint_pos'):
             self.current_joint_targets = self.default_joint_pos.clone()
             self.articulation.set_joint_position_target(self.current_joint_targets)
@@ -341,6 +344,11 @@ class Robot:
         [输出]: ur10_joint_targets (Tensor N*6)
         """
         if self.ik_controller is None: return None
+
+        # 失败后维持当前关节位置，等待上层终止该环境的动作。
+        # 不再重复进入可能持续失败的 IK 求解。
+        if self.ik_failed:
+            return self.articulation.data.joint_pos[:, self.ur10_dof_indices].clone()
         
         # Transform target to world frame
         root_quat_w = self.articulation.data.root_quat_w
@@ -375,12 +383,6 @@ class Robot:
             # 注意: 如果有一个环境奇异，这里的 batch compute 可能会抛出异常
             ur10_joint_targets = self.ik_controller.compute(ee_pose_w[:, :3], ee_quat, jacobian[:, :, self.ur10_dof_indices], self.articulation.data.joint_pos[:, self.ur10_dof_indices])
             
-            # 2. 如果之前有 fail indices, 需要覆盖这些环境的 target 为当前位置 (Freeze)
-            if self.ik_fail_indices:
-                current_pos = self.articulation.data.joint_pos[:, self.ur10_dof_indices]
-                for idx in self.ik_fail_indices:
-                    ur10_joint_targets[idx] = current_pos[idx]
-                    
             return ur10_joint_targets
             
         except (torch._C._LinAlgError, RuntimeError) as e:
@@ -391,11 +393,6 @@ class Robot:
             ur10_joint_targets = self.articulation.data.joint_pos[:, self.ur10_dof_indices].clone() # 默认保持当前位置
             
             for i in range(num_envs):
-                # 如果已经标记为失败，跳过 (保持当前位置)
-                if i in self.ik_fail_indices:
-                    # print(f"⚠ [IK] 环境 {i} IK 失败 (Singularity/Error). 继续...")
-                    continue
-                    
                 try:
                     # 提取单个环境的数据
                     # 注意: DifferentialIKController.compute 需要 batch 维度
@@ -409,9 +406,8 @@ class Robot:
                     ur10_joint_targets[i] = target_i[0]
                     
                 except (torch._C._LinAlgError, RuntimeError):
-                    if i not in self.ik_fail_indices:
-                        print(f"❌ [IK FailSafe] Env {i} IK 失败 (Singularity/Error)")
-                        self.ik_fail_indices.add(i)
+                    print("❌ [IK FailSafe] 当前 Robot IK 失败 (Singularity/Error)")
+                    self.ik_failed = True
                     # 保持 ur10_joint_targets[i] 为当前位置 (Freeze)
                     
             return ur10_joint_targets
@@ -653,6 +649,12 @@ class Robot:
         [输出]: None
         """
         from isaaclab.utils.math import quat_slerp, quat_apply, quat_inv, quat_mul  # 四元数球面线性插值
+
+        # 兼容保留 dt 形参，但运行时必须以 PhysX 的真实步长为准。
+        # 否则轨迹 elapsed_time 会与 Scene.step() 推进的物理时间分离。
+        dt = float(scene.sim.get_physics_dt())
+        if dt <= 0.0:
+            raise RuntimeError(f"无效的 PhysX 物理步长: {dt}")
         
         offset_vec = torch.tensor([0.0, 0.0, 0.2333], device=self.device)
         ee_pos = self.get_end_effector_pose(self.ee_body_name)[0]
@@ -723,7 +725,6 @@ class Robot:
             self.move_gripper(gripper_pos)
             self.write()
             scene.step()
-            self.update(dt)
             
             elapsed_time += dt
             
@@ -745,5 +746,3 @@ class Robot:
                 if pos_err < threshold and rot_err < 0.001: 
                      if (stable_steps := stable_steps + 1) > 10 and elapsed_time >= durations.max(): break
                 else: stable_steps = 0
-
-
