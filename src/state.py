@@ -30,6 +30,12 @@ class State:
         self.env_idx = env_idx
         self.env_origin = env_origin
         self._sam = None
+        # 供随后动作原语复用的观测帧。网络输入深度需要归一化为 uint8，
+        # 推点高度则需要米制深度；两者必须来自同一次相机采集。
+        # 该缓存只由 get_state() 对应的 get_img(cache_observation=True) 更新，
+        # 普通诊断/成功判定中的 get_img() 不会覆盖它。
+        self._cached_observation_images = None
+        self._cached_observation_masks = None
         
     # @property
     # def sam(self):
@@ -49,6 +55,8 @@ class State:
         self.camera.update(dt)
     def reset(self):
         self.camera.reset()
+        self._cached_observation_images = None
+        self._cached_observation_masks = None
     
     def get_state(self, spawned_objects):
         """
@@ -67,9 +75,21 @@ class State:
         import numpy as np
         
         # 1. 获取原始图像
-        rgb, depth, seg = self.get_img()
-        
+        # 同一次采集返回给网络的是归一化深度，同时在 State 内缓存对应的
+        # 米制深度和分割图，供选完动作后的推点计算直接复用。
+        self._cached_observation_images = None
+        self._cached_observation_masks = None
+        images = self.get_img(cache_observation=True)
+        if images is None:
+            print("⚠ 警告: 无法获取图像数据")
+            return None
+        rgb, depth, seg = images
+
         if depth is None or seg is None:
+            # 不允许只有半个快照留下，否则下游可能把无分割的
+            # 图像误当成网络已经评价过的完整动作帧。
+            self._cached_observation_images = None
+            self._cached_observation_masks = None
             print("⚠ 警告: 无法获取图像数据")
             return None
         
@@ -91,6 +111,14 @@ class State:
         # 现在逻辑: Channel 2 = global_mask (包含 target)
         obstacle_mask = global_mask.copy()
         # obstacle_mask[target_mask > 0] = 0  # [User Request] Keep target in global mask
+
+        # 推点几何必须复用网络真正看到的这两张掩膜，而不是在
+        # 选完动作后再用另一套规则从 seg 图推断。使用独立副本，
+        # 保证后续 tensor 转换或调用方不会改写动作帧。
+        self._cached_observation_masks = (
+            target_mask.copy(),
+            obstacle_mask.copy(),
+        )
         
         # 5. 转换为tensor (保持 uint8 [0, 255])
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -110,12 +138,14 @@ class State:
         # print(f"[get_state] 生成状态tensor: {state_tensor.shape}, device={state_tensor.device}, dtype={state_tensor.dtype}")
         
         return state_tensor
-    def get_img(self, hide_robot=True, normalize_depth=True):
+    def get_img(self, hide_robot=True, normalize_depth=True, cache_observation=False):
         """
         获取RGB、深度图和实例分割图，并统一resize到320x320
         Args:
             hide_robot: 是否隐藏机器人
             normalize_depth: 是否将深度图归一化到0-255 (False则返回米为单位的float深度)
+            cache_observation: 是否缓存本次采集的 RGB、米制深度和分割图，供随后
+                的动作原语复用。仅 get_state() 应设为 True。
         Returns: (rgb_320, depth_320, seg_320) 或 None
         """
         # 获取原始图像数据（包含segmentation）
@@ -233,6 +263,15 @@ class State:
         resized_rgb = cv2.resize(crop_rgb, (320, 320), interpolation=cv2.INTER_AREA)
         resized_depth = cv2.resize(crop_depth, (320, 320), interpolation=cv2.INTER_NEAREST)
         resized_seg = cv2.resize(crop_seg, (320, 320), interpolation=cv2.INTER_NEAREST) if crop_seg is not None else None
+
+        # 必须在深度归一化之前保存米制深度。使用独立副本，避免下面的 dtype
+        # 转换或调用方修改返回数组时污染动作帧。
+        if cache_observation:
+            self._cached_observation_images = (
+                resized_rgb.copy(),
+                resized_depth.astype(np.float32, copy=True),
+                resized_seg.copy() if resized_seg is not None else None,
+            )
         
         # [DEBUG] Print depth stats
         if not normalize_depth:
@@ -257,6 +296,22 @@ class State:
             resized_depth = (norm * 255.0).astype(np.uint8)
 
         return resized_rgb, resized_depth, resized_seg
+
+    def get_cached_observation_images(self):
+        """返回最近一次网络状态所对应的 RGB、米制深度和分割图。
+
+        本方法不会触发相机采集。返回数组是 State 持有的只读语义快照；动作
+        原语当前仅读取这些数组，不应原地修改。
+        """
+        return self._cached_observation_images
+
+    def get_cached_observation_masks(self):
+        """返回最近一次网络输入中的目标掩膜和全局掩膜。
+
+        这两张掩膜与 ``get_cached_observation_images()`` 中的米制深度
+        属于同一帧，也就是网络输入的第 2/3 通道原数组。
+        """
+        return self._cached_observation_masks
 
     def _is_obj_in_env(self, obj):
         """

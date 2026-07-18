@@ -70,6 +70,8 @@ def parse_args():
                         help='有效推动所需的目标物体物理质心 XY 位移阈值（米，严格大于）')
     parser.add_argument('--empty_push_force_threshold', default=1.0, type=float,
                         help='有效推动所需的任一夹爪手指峰值接触力阈值（N，严格大于）')
+    parser.add_argument('--empty_push_rotation_arc_threshold', default=0.01, type=float,
+                        help='有效推动所需的目标物体旋转边缘位移 S=theta*D 阈值（米，严格大于）')
     parser.add_argument('--explosion_linear_speed_threshold', default=1.0, type=float,
                         help='动力学崩飞的物体三维总线速度阈值（m/s，严格大于）')
     parser.add_argument('--explosion_linear_acceleration_threshold', default=50.0, type=float,

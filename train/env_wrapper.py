@@ -57,6 +57,17 @@ class PushEnv(SuccessSeparationMixin):
         self.empty_push_force_threshold = float(
             getattr(args, 'empty_push_force_threshold', 1.0)
         )
+        self.empty_push_rotation_arc_threshold = float(
+            getattr(args, 'empty_push_rotation_arc_threshold', 0.01)
+        )
+        if (
+            not np.isfinite(self.empty_push_rotation_arc_threshold)
+            or self.empty_push_rotation_arc_threshold < 0.0
+        ):
+            raise ValueError('empty_push_rotation_arc_threshold 必须是大于等于 0 的有限值')
+        # D 对同一“源网格 + spawn 缩放 + 物理质心”保持不变，跨环境和
+        # episode 复用，避免反复扫描体积较大的 textured.obj。
+        self._mesh_xy_radius_cache = {}
         # 动力学崩飞检测：只使用物体的三维总线速度和三维总线加速度。
         # 阈值由所有训练/评估入口显式传入；getattr 默认值兼容诊断脚本的简化 Args。
         self.explosion_linear_speed_threshold = float(
@@ -96,7 +107,7 @@ class PushEnv(SuccessSeparationMixin):
         self.dynamics_explosion_max_speed_streaks = {}
         self.dynamics_explosion_speed_intervals = {}
         self.dynamics_explosion_acceleration_events = {}
-        # 本次动作的物理测量。位移来自 PhysX 物理质心，接触力复用现有 tracker。
+        # 本次动作的物理测量。位移/姿态来自 PhysX，接触力复用现有 tracker。
         self.action_push_measurements = {}
         self.previous_actions = [None for _ in range(self.num_envs)]
         self.opposite_action_streaks = [0 for _ in range(self.num_envs)]
@@ -111,7 +122,7 @@ class PushEnv(SuccessSeparationMixin):
         # tracker 为 None (关闭/未启用) 时此集合恒空 → 非法接触检查是无害的 no-op。
         self.illegal_contact_envs = {}  # env_idx -> info dict
         # 每步动作的统一接触结果，供训练/评估输出“准备推谁、实际碰到谁”。
-        # status: no_contact | legal | illegal | unavailable
+        # status: no_contact | legal | illegal | unavailable | invalid_geometry
         self.action_contact_results = {}  # env_idx -> info dict
 
         # [点1-调试] 接触事件原始记录 (仅供 inspect_sim 等调试脚本消费, 训练时默认关闭)。
@@ -399,6 +410,54 @@ class PushEnv(SuccessSeparationMixin):
                     action_idx, env_idx, state, self.scene, env_objects
                 )
 
+                # 几何算法明确判定为空推时，不生成默认推点，也不进入机器人轨迹。
+                # 后续奖励层通过 action_contact_results / 缺失运动测量沿用当前空推惩罚。
+                if (
+                    push_point is None
+                    or contact_spec is None
+                    or not contact_spec.get('geometry_valid', True)
+                ):
+                    intended_path = (
+                        contact_spec.get('intended_prim_path')
+                        if contact_spec is not None else None
+                    )
+                    push_state_before = self._capture_object_push_state(
+                        intended_path, spawned_objects
+                    )
+                    tracker = getattr(self.scene, 'contact_tracker', None)
+                    self.action_push_measurements[env_idx] = {
+                        'intended_prim_path': intended_path,
+                        'intended_model_id': (
+                            contact_spec.get('intended_model_id')
+                            if contact_spec is not None else None
+                        ),
+                        **push_state_before,
+                        'peak_contact_force_n': 0.0,
+                        'contact_available': bool(
+                            tracker is not None and tracker.is_ready
+                        ),
+                        'geometry_invalid': True,
+                        'geometry_invalid_reason': (
+                            contact_spec.get('geometry_invalid_reason')
+                            if contact_spec is not None else 'geometry_error'
+                        ),
+                    }
+                    self.action_contact_results[env_idx] = {
+                        'status': 'invalid_geometry',
+                        'intended_model_id': (
+                            contact_spec.get('intended_model_id')
+                            if contact_spec is not None else None
+                        ),
+                        'intended_prim_path': intended_path,
+                        'actual_model_id': None,
+                        'actual_prim_path': None,
+                        'geometry_invalid_reason': (
+                            contact_spec.get('geometry_invalid_reason')
+                            if contact_spec is not None else 'geometry_error'
+                        ),
+                    }
+                    continue
+
                 push_points.append(push_point)
                 direction_indices.append(direction_idx)
                 contact_specs.append(contact_spec)
@@ -408,12 +467,29 @@ class PushEnv(SuccessSeparationMixin):
                 print(f"❌ [Env{env_idx}] 动作{action_idx}计算失败: {e}")
                 import traceback
                 traceback.print_exc()
-                # 使用默认推点（环境中心）
-                push_point = torch.tensor([0.75, 0.0, 0.1], device=self.device)
-                push_points.append(push_point)
-                direction_indices.append(0)
-                contact_specs.append(None)  # 计算失败: 跳过接触判定
-                active_envs.append(env_idx)
+                # 推点计算异常也不能退化到环境中心，否则会把算法错误转化为
+                # 实际非法接触。按几何无效处理，沿用当前空推惩罚。
+                tracker = getattr(self.scene, 'contact_tracker', None)
+                self.action_push_measurements[env_idx] = {
+                    'intended_prim_path': None,
+                    'intended_model_id': None,
+                    'com_before_w': None,
+                    'peak_contact_force_n': 0.0,
+                    'contact_available': bool(
+                        tracker is not None and tracker.is_ready
+                    ),
+                    'geometry_invalid': True,
+                    'geometry_invalid_reason': 'push_point_compute_error',
+                }
+                self.action_contact_results[env_idx] = {
+                    'status': 'invalid_geometry',
+                    'intended_model_id': None,
+                    'intended_prim_path': None,
+                    'actual_model_id': None,
+                    'actual_prim_path': None,
+                    'geometry_invalid_reason': 'push_point_compute_error',
+                }
+                continue
 
         # 如果没有active环境，直接返回
         if not active_envs:
@@ -457,14 +533,16 @@ class PushEnv(SuccessSeparationMixin):
 
             _spec = contact_specs[active_envs.index(env_idx)]
             intended_path = _spec.get('intended_prim_path') if _spec is not None else None
-            com_before = self._get_object_com_position(intended_path, spawned_objects)
+            push_state_before = self._capture_object_push_state(
+                intended_path, spawned_objects
+            )
             tracker_ready = tracker is not None and tracker.is_ready
             self.action_push_measurements[env_idx] = {
                 'intended_prim_path': intended_path,
                 'intended_model_id': (
                     _spec.get('intended_model_id') if _spec is not None else None
                 ),
-                'com_before_w': com_before,
+                **push_state_before,
                 'peak_contact_force_n': 0.0,
                 'contact_available': tracker_ready,
             }
@@ -950,6 +1028,8 @@ class PushEnv(SuccessSeparationMixin):
             'contact_intended_prim_path': result.get('intended_prim_path'),
             'contact_actual_model_id': result.get('actual_model_id'),
             'contact_actual_prim_path': result.get('actual_prim_path'),
+            'geometry_invalid': result.get('status') == 'invalid_geometry',
+            'geometry_invalid_reason': result.get('geometry_invalid_reason'),
         }
 
     def _monitor_dynamics_explosion(self, spawned_objects, phase):
@@ -1142,23 +1222,163 @@ class PushEnv(SuccessSeparationMixin):
 
     def _get_object_com_position(self, prim_path, spawned_objects=None):
         """直接从 PhysX tensor 读取指定模型的世界坐标物理质心。"""
+        obj = self._get_object_by_prim_path(prim_path, spawned_objects)
+        if obj is None:
+            return None
+        try:
+            # Isaac Lab 2.1.1 已提供 root_com_pos_w；它由 PhysX 的
+            # actor pose 与 get_coms() 组合得到，不是模型 USD 原点。
+            com = obj.data.root_com_pos_w[0]
+            if not bool(torch.isfinite(com).all()):
+                return None
+            return com.detach().clone()
+        except Exception:
+            return None
+
+    def _get_object_by_prim_path(self, prim_path, spawned_objects=None):
+        """按精确 prim path 查找 RigidObject。"""
         if not prim_path:
             return None
         objects = self.spawned_objects if spawned_objects is None else spawned_objects
         normalized_path = str(prim_path).rstrip('/')
         for obj in self._iter_spawned_objects(objects):
             try:
-                if obj.cfg.prim_path.rstrip('/') != normalized_path:
-                    continue
-                # Isaac Lab 2.1.1 已提供 root_com_pos_w；它由 PhysX 的
-                # actor pose 与 get_coms() 组合得到，不是模型 USD 原点。
-                com = obj.data.root_com_pos_w[0]
-                if not bool(torch.isfinite(com).all()):
-                    return None
-                return com.detach().clone()
+                if obj.cfg.prim_path.rstrip('/') == normalized_path:
+                    return obj
             except Exception:
-                return None
+                continue
         return None
+
+    def _get_object_orientation(self, prim_path, spawned_objects=None):
+        """读取物体 actor frame 的世界坐标四元数 ``(w, x, y, z)``。"""
+        obj = self._get_object_by_prim_path(prim_path, spawned_objects)
+        if obj is None:
+            return None
+        try:
+            quat = obj.data.root_quat_w[0]
+            if not bool(torch.isfinite(quat).all()):
+                return None
+            return quat.detach().clone()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _compute_mesh_xy_radius(mesh_path, scale_xy, com_xy):
+        """流式计算真实 OBJ 顶点到物理质心的最大 XY 投影距离。"""
+        max_radius_sq = -1.0
+        with open(mesh_path, 'r', encoding='utf-8', errors='ignore') as mesh_file:
+            for line in mesh_file:
+                # 只读取顶点行，排除 vn/vt；避免把大型网格完整载入内存。
+                if len(line) < 3 or line[0] != 'v' or not line[1].isspace():
+                    continue
+                fields = line.split()
+                if len(fields) < 4:
+                    continue
+                try:
+                    vertex_x = float(fields[1]) * scale_xy[0]
+                    vertex_y = float(fields[2]) * scale_xy[1]
+                except ValueError:
+                    continue
+                radius_sq = (
+                    (vertex_x - com_xy[0]) ** 2
+                    + (vertex_y - com_xy[1]) ** 2
+                )
+                max_radius_sq = max(max_radius_sq, radius_sq)
+        return max_radius_sq ** 0.5 if max_radius_sq >= 0.0 else None
+
+    def _get_cached_mesh_xy_radius(self, mesh_path, scale_xy, com_xy):
+        """按网格、缩放和物理质心缓存 D。"""
+        key = (
+            os.path.realpath(mesh_path),
+            round(float(scale_xy[0]), 9),
+            round(float(scale_xy[1]), 9),
+            round(float(com_xy[0]), 9),
+            round(float(com_xy[1]), 9),
+        )
+        if key not in self._mesh_xy_radius_cache:
+            self._mesh_xy_radius_cache[key] = self._compute_mesh_xy_radius(
+                mesh_path, scale_xy, com_xy
+            )
+        return self._mesh_xy_radius_cache[key]
+
+    def _get_object_rotation_radius(self, prim_path, spawned_objects=None):
+        """返回 ``(D, mesh_path, unavailable_reason)``，D 的单位为米。"""
+        obj = self._get_object_by_prim_path(prim_path, spawned_objects)
+        if obj is None:
+            return None, None, 'object_unresolved'
+        try:
+            source_usd_path = getattr(
+                obj, 'source_usd_path', str(obj.cfg.spawn.usd_path)
+            )
+            mesh_path = os.path.splitext(str(source_usd_path))[0] + '.obj'
+            if not os.path.isfile(mesh_path):
+                return None, mesh_path, 'mesh_file_unavailable'
+
+            spawn_scale = getattr(obj.cfg.spawn, 'scale', None) or (1.0, 1.0, 1.0)
+            scale_xy = (float(spawn_scale[0]), float(spawn_scale[1]))
+            com_b = obj.data.body_com_pos_b[0, 0]
+            if not bool(torch.isfinite(com_b[:2]).all()):
+                return None, mesh_path, 'local_com_unavailable'
+            com_xy = (float(com_b[0].item()), float(com_b[1].item()))
+            radius_m = self._get_cached_mesh_xy_radius(
+                mesh_path, scale_xy, com_xy
+            )
+            if radius_m is None or not np.isfinite(radius_m):
+                return None, mesh_path, 'mesh_vertices_unavailable'
+            return float(radius_m), mesh_path, None
+        # 旋转几何是空推判定的并列分支；任何读取异常都只禁用该分支，
+        # 不得阻断原有“接触力 + 质心位移”判定或动作执行。
+        except Exception:
+            return None, None, 'rotation_geometry_error'
+
+    def _capture_object_push_state(self, prim_path, spawned_objects=None):
+        """记录动作前用于空推判定的质心、姿态和旋转半径。"""
+        radius_m, mesh_path, radius_reason = self._get_object_rotation_radius(
+            prim_path, spawned_objects
+        )
+        return {
+            'com_before_w': self._get_object_com_position(
+                prim_path, spawned_objects
+            ),
+            'orientation_before_w': self._get_object_orientation(
+                prim_path, spawned_objects
+            ),
+            'rotation_radius_m': radius_m,
+            'rotation_mesh_path': mesh_path,
+            'rotation_geometry_available': radius_m is not None,
+            'rotation_geometry_reason': radius_reason,
+        }
+
+    @staticmethod
+    def _yaw_from_quaternion(quaternion):
+        """从 ``(w, x, y, z)`` 四元数提取世界 Z 轴偏航角。"""
+        if quaternion is None:
+            return None
+        try:
+            if isinstance(quaternion, torch.Tensor):
+                values = quaternion.detach().cpu().tolist()
+            else:
+                values = list(quaternion)
+            if len(values) != 4 or not all(np.isfinite(values)):
+                return None
+            norm = float(np.linalg.norm(values))
+            if norm <= 1e-12:
+                return None
+            w, x, y, z = (float(value) / norm for value in values)
+            return float(np.arctan2(
+                2.0 * (w * z + x * y),
+                1.0 - 2.0 * (y * y + z * z),
+            ))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _minimum_yaw_change(yaw_before, yaw_after):
+        """返回跨越 ``±π`` 时仍正确的最小绝对偏航变化，范围 ``[0, π]``。"""
+        if yaw_before is None or yaw_after is None:
+            return None
+        delta = float(yaw_after) - float(yaw_before)
+        return abs(float(np.arctan2(np.sin(delta), np.cos(delta))))
 
     def _accumulate_intended_contact_force(self, env_idx, contacts):
         """累计当前动作中任一受监控手指对意图物体的最大接触力。"""
@@ -1181,55 +1401,106 @@ class PushEnv(SuccessSeparationMixin):
     @staticmethod
     def _evaluate_push_effectiveness(
         displacement_m,
+        rotation_arc_m,
         peak_force_n,
         displacement_threshold_m=0.01,
+        rotation_arc_threshold_m=0.01,
         force_threshold_n=1.0,
         target_resolved=True,
         com_available=True,
+        rotation_available=True,
         contact_available=True,
     ):
-        """返回 ``(is_empty, displacement_ok, force_ok, reason)``。"""
-        if not target_resolved:
-            return True, False, False, 'unresolved_target'
-        if not com_available:
-            return True, False, False, 'com_unavailable'
-        if not contact_available:
-            return True, displacement_m > displacement_threshold_m, False, 'contact_unavailable'
+        """按 ``接触力 AND (质心位移 OR 旋转边缘位移)`` 判定空推。"""
+        displacement_ok = bool(
+            com_available
+            and np.isfinite(displacement_m)
+            and displacement_m > displacement_threshold_m
+        )
+        rotation_ok = bool(
+            rotation_available
+            and np.isfinite(rotation_arc_m)
+            and rotation_arc_m > rotation_arc_threshold_m
+        )
+        force_ok = bool(
+            contact_available
+            and np.isfinite(peak_force_n)
+            and peak_force_n > force_threshold_n
+        )
+        movement_ok = displacement_ok or rotation_ok
+        is_empty = not (target_resolved and force_ok and movement_ok)
 
-        displacement_ok = displacement_m > displacement_threshold_m
-        force_ok = peak_force_n > force_threshold_n
-        if displacement_ok and force_ok:
-            reason = 'valid'
-        elif not displacement_ok and not force_ok:
-            reason = 'displacement_and_force_below_threshold'
-        elif not displacement_ok:
-            reason = 'displacement_below_threshold'
-        else:
+        if not target_resolved:
+            reason = 'unresolved_target'
+        elif not contact_available:
+            reason = 'contact_unavailable'
+        elif not force_ok and not movement_ok:
+            reason = 'force_and_movement_below_threshold'
+        elif not force_ok:
             reason = 'force_below_threshold'
-        return not (displacement_ok and force_ok), displacement_ok, force_ok, reason
+        elif displacement_ok and rotation_ok:
+            reason = 'valid_by_displacement_and_rotation'
+        elif displacement_ok:
+            reason = 'valid_by_displacement'
+        elif rotation_ok:
+            reason = 'valid_by_rotation'
+        elif not com_available and not rotation_available:
+            reason = 'movement_measurement_unavailable'
+        elif not com_available:
+            reason = 'displacement_unavailable_and_rotation_below_threshold'
+        elif not rotation_available:
+            reason = 'displacement_below_threshold_and_rotation_unavailable'
+        else:
+            reason = 'displacement_and_rotation_below_threshold'
+        return is_empty, displacement_ok, rotation_ok, force_ok, reason
 
     def _check_empty_push(self, env_idx):
-        """用“物理质心 XY 位移 AND 意图物体峰值接触力”判定空推。"""
+        """用“接触力 AND (质心 XY 位移 OR 旋转边缘位移)”判定空推。"""
         measurement = self.action_push_measurements.get(env_idx, {})
         intended_path = measurement.get('intended_prim_path')
         com_before = measurement.get('com_before_w')
         com_after = self._get_object_com_position(intended_path)
+        orientation_before = measurement.get('orientation_before_w')
+        orientation_after = self._get_object_orientation(intended_path)
+        rotation_radius_m = measurement.get('rotation_radius_m')
         target_resolved = bool(intended_path)
         com_available = com_before is not None and com_after is not None
 
         displacement_m = 0.0
         if com_available:
             displacement_m = float(torch.linalg.vector_norm(com_after[:2] - com_before[:2]).item())
+        yaw_before_rad = self._yaw_from_quaternion(orientation_before)
+        yaw_after_rad = self._yaw_from_quaternion(orientation_after)
+        rotation_theta_rad = self._minimum_yaw_change(
+            yaw_before_rad, yaw_after_rad
+        )
+        rotation_available = (
+            rotation_theta_rad is not None
+            and rotation_radius_m is not None
+            and np.isfinite(rotation_radius_m)
+        )
+        rotation_arc_m = 0.0
+        if rotation_available:
+            rotation_arc_m = float(rotation_theta_rad * rotation_radius_m)
         peak_force_n = float(measurement.get('peak_contact_force_n', 0.0))
         contact_available = bool(measurement.get('contact_available', False))
 
-        is_empty, displacement_ok, force_ok, reason = self._evaluate_push_effectiveness(
+        (
+            is_empty,
+            displacement_ok,
+            rotation_ok,
+            force_ok,
+            reason,
+        ) = self._evaluate_push_effectiveness(
             displacement_m=displacement_m,
+            rotation_arc_m=rotation_arc_m,
             peak_force_n=peak_force_n,
             displacement_threshold_m=self.empty_push_displacement_threshold,
+            rotation_arc_threshold_m=self.empty_push_rotation_arc_threshold,
             force_threshold_n=self.empty_push_force_threshold,
             target_resolved=target_resolved,
             com_available=com_available,
+            rotation_available=rotation_available,
             contact_available=contact_available,
         )
         metrics = {
@@ -1239,14 +1510,38 @@ class PushEnv(SuccessSeparationMixin):
             'axes': 'xy',
             'com_before_w': com_before.detach().cpu().tolist() if com_before is not None else None,
             'com_after_w': com_after.detach().cpu().tolist() if com_after is not None else None,
+            'orientation_before_w': (
+                orientation_before.detach().cpu().tolist()
+                if orientation_before is not None else None
+            ),
+            'orientation_after_w': (
+                orientation_after.detach().cpu().tolist()
+                if orientation_after is not None else None
+            ),
             'displacement_m': displacement_m,
             'displacement_threshold_m': self.empty_push_displacement_threshold,
+            'yaw_before_rad': yaw_before_rad,
+            'yaw_after_rad': yaw_after_rad,
+            'rotation_theta_rad': rotation_theta_rad,
+            'rotation_radius_m': rotation_radius_m,
+            'rotation_arc_m': rotation_arc_m,
+            'rotation_arc_threshold_m': self.empty_push_rotation_arc_threshold,
+            'rotation_mesh_path': measurement.get('rotation_mesh_path'),
+            'rotation_geometry_available': measurement.get(
+                'rotation_geometry_available', False
+            ),
+            'rotation_geometry_reason': measurement.get(
+                'rotation_geometry_reason'
+            ),
             'peak_contact_force_n': peak_force_n,
             'force_threshold_n': self.empty_push_force_threshold,
             'target_resolved': target_resolved,
             'com_available': com_available,
+            'rotation_available': rotation_available,
             'contact_available': contact_available,
             'displacement_ok': displacement_ok,
+            'rotation_ok': rotation_ok,
+            'movement_ok': displacement_ok or rotation_ok,
             'force_ok': force_ok,
             'reason': reason,
         }

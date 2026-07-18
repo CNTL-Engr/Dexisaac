@@ -9,9 +9,22 @@ from pathlib import Path
 
 PPM = 320.0 / 1.0  # pixels per meter
 CAMERA_Z = 1.25
-TARGET_PUSH_SAFETY_MARGIN = 0.008
-LEGACY_OBSTACLE_SAFETY_MARGIN = 0.015
 
+# 夹爪在图像平面内的近似足迹尺寸。沿推动方向的尺寸较短，横向尺寸较长。
+# 这些尺寸同时用于“候选窗口是否覆盖意图物体/躲避物体”的硬约束。
+GRIPPER_LATERAL_M = 0.03
+GRIPPER_PUSH_AXIS_M = 0.02
+
+# sim-ur10 在 452 px/m 图像中以 15 px 作为线段断开阈值。
+# 使用米制常量保存同一物理含义，后续可直接在此处调整。
+EDGE_SEGMENT_GAP_M = 9.0 / 452.0
+
+# 迁移后的边缘防撞邻域半径。当前推点图像覆盖 1 m / 320 px，30 mm
+# 对应 9.6 px；运行时向上取整为 10 px，保证实际检查范围不小于 30 mm。
+EDGE_NEIGHBOR_RADIUS_M = 0.030
+EDGE_INWARD_SAMPLE_M = 0.009
+EDGE_HEIGHT_OFFSET_M = 0.015
+EDGE_HEIGHT_FLOOR_M = 0.035
 
 def _ensure_uint8_mask(mask):
     """Normalize binary-like masks to uint8 [0, 255]."""
@@ -68,111 +81,355 @@ def _infer_target_and_background_id(seg_map, target_mask):
     return target_id, background_id
 
 
-def _build_sector_mask(shape, center_u, center_v, opposite_angle_deg, angle_range_deg):
-    """Create the angular search sector used by the target-push policy."""
-    h, w = shape
-    y_grid, x_grid = np.ogrid[:h, :w]
+def _cardinal_push_step(push_angle_deg):
+    """将离散推动角映射成图像坐标中的单位步长 (du, dv)。"""
+    angle = int(round(float(push_angle_deg))) % 360
+    mapping = {
+        0: (1, 0),
+        90: (0, 1),
+        180: (-1, 0),
+        270: (0, -1),
+    }
+    if angle not in mapping:
+        raise ValueError(f"推点算法只支持 C4 方向，收到角度 {push_angle_deg}")
+    return mapping[angle]
 
-    dx = x_grid - center_u
-    dy = y_grid - center_v
-    angles = np.degrees(np.arctan2(dy, dx))
-    angles = (angles + 360) % 360
+def _extract_rear_edge_for_direction(object_mask, push_angle_deg):
+    """提取意图物体迎向夹爪一侧的离散边缘。
 
-    angle_min = (opposite_angle_deg - angle_range_deg + 360) % 360
-    angle_max = (opposite_angle_deg + angle_range_deg) % 360
+    这是 sim-ur10 ``PushPointState`` 中逐行/逐列扫描逻辑的 320px 版本。
+    连接阈值用米制常数换算，避免直接复用 452px 工作空间中的像素阈值。
+    """
+    mask = _ensure_uint8_mask(object_mask)
+    if mask is None:
+        return np.zeros((0, 0), dtype=np.uint8), []
 
-    if angle_min < angle_max:
-        sector_mask = (angles >= angle_min) & (angles <= angle_max)
+    h, w = mask.shape
+    points = []
+    angle = int(round(float(push_angle_deg))) % 360
+    if angle == 90:  # X+：每列最上方像素
+        for u in range(w):
+            rows = np.where(mask[:, u] > 0)[0]
+            if rows.size:
+                points.append((u, int(rows[0])))
+    elif angle == 0:  # Y+：每行最左方像素
+        for v in range(h):
+            cols = np.where(mask[v, :] > 0)[0]
+            if cols.size:
+                points.append((int(cols[0]), v))
+    elif angle == 270:  # X-：每列最下方像素
+        for u in range(w):
+            rows = np.where(mask[:, u] > 0)[0]
+            if rows.size:
+                points.append((u, int(rows[-1])))
+    elif angle == 180:  # Y-：每行最右方像素
+        for v in range(h):
+            cols = np.where(mask[v, :] > 0)[0]
+            if cols.size:
+                points.append((int(cols[-1]), v))
     else:
-        sector_mask = (angles >= angle_min) | (angles <= angle_max)
+        raise ValueError(f"推点算法只支持 C4 方向，收到角度 {push_angle_deg}")
 
-    return sector_mask.astype(np.uint8) * 255
+    edge = np.zeros_like(mask, dtype=np.uint8)
+    if not points:
+        return edge, []
+
+    max_gap_px = max(1, int(np.ceil(0.022 * PPM)))
+    bridge_gap_px = max(1, int(np.ceil(0.009 * PPM)))
+    for idx, (u, v) in enumerate(points):
+        edge[v, u] = 255
+        if idx == 0:
+            continue
+        pu, pv = points[idx - 1]
+        du = abs(u - pu)
+        dv = abs(v - pv)
+        dist = float(np.hypot(du, dv))
+        slope = float(np.degrees(np.arctan2(dv, du))) if du > 0 else 90.0
+        if (dist <= max_gap_px and slope < 75.0) or dist <= bridge_gap_px:
+            cv2.line(edge, (pu, pv), (u, v), 255, 1)
+
+    ys, xs = np.where(edge > 0)
+    return edge, list(zip(xs.tolist(), ys.tolist()))
 
 
-def _compute_safe_push_from_mask(depth_map, object_mask, center_u, center_v,
-                                 push_angle_deg, center_depth):
+def _filter_edge_by_height_30mm(edge_mask, edge_points, global_mask,
+                                object_mask, depth_map):
+    """按 30 mm 邻域和相对高度过滤边缘点。
+
+    与源项目一致：其他物体深度小于等于意图物体局部边缘深度时，
+    认为其物理高度等于或高于边缘，删除对应边缘点。所有剩余片段均保留，
+    由后续横向投影聚类和线段中心选择统一处理。
     """
-    Reuse the current target-push heuristic on an arbitrary object mask.
-    Returns a safe XY push point and push_z.
-    """
+    edge_mask = _ensure_uint8_mask(edge_mask)
     object_mask = _ensure_uint8_mask(object_mask)
-    if object_mask is None or np.sum(object_mask > 0) == 0:
-        max_height = CAMERA_Z - center_depth
-        push_z = max(0.03, min(max_height + TARGET_PUSH_SAFETY_MARGIN, 0.15))
-        return center_u, center_v, push_z, center_depth
+    global_mask = _ensure_uint8_mask(global_mask)
+    depth = np.asarray(depth_map, dtype=np.float32)
+    if edge_mask is None or object_mask is None:
+        return edge_mask, [], np.zeros_like(depth, dtype=bool), np.zeros_like(depth, dtype=bool)
 
-    opposite_angle_deg = (push_angle_deg + 180) % 360
-    sector_mask = _build_sector_mask(
-        object_mask.shape, center_u, center_v, opposite_angle_deg, angle_range_deg=15
+    radius_px = max(1, int(np.ceil(EDGE_NEIGHBOR_RADIUS_M * PPM)))
+    neighborhood_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * radius_px + 1, 2 * radius_px + 1)
+    )
+    neighborhood_mask = cv2.dilate(edge_mask, neighborhood_kernel, iterations=1) > 0
+
+    other_mask = np.zeros_like(object_mask, dtype=bool)
+    if global_mask is not None:
+        other_mask = (global_mask > 0) & ~(object_mask > 0)
+
+    other_depth = np.full(depth.shape, 10.0, dtype=np.float32)
+    other_depth[other_mask] = depth[other_mask]
+    highest_other_depth = cv2.erode(other_depth, neighborhood_kernel, iterations=1)
+
+    local_radius_px = max(1, int(np.ceil(EDGE_INWARD_SAMPLE_M * PPM)))
+    local_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * local_radius_px + 1, 2 * local_radius_px + 1)
+    )
+    object_depth = np.full(depth.shape, 10.0, dtype=np.float32)
+    object_depth[object_mask > 0] = depth[object_mask > 0]
+    highest_object_depth = cv2.erode(object_depth, local_kernel, iterations=1)
+
+    filtered = edge_mask.copy()
+    deleted = np.zeros_like(filtered, dtype=np.uint8)
+    kept = []
+    for u, v in edge_points:
+        if highest_other_depth[v, u] <= highest_object_depth[v, u]:
+            filtered[v, u] = 0
+            deleted[v, u] = 255
+        else:
+            kept.append((u, v))
+
+    return filtered, kept, neighborhood_mask, deleted > 0
+
+
+def _select_sim_ur10_edge_anchor(filtered_edge_mask, object_mask, global_mask,
+                                  center_u, center_v, push_angle_deg):
+    """迁移 sim-ur10 的线段中心锚点，并做 R2F140 足迹可行性检查。
+
+    边缘先按横向投影间距聚类；线段按中心到意图物体质心的距离排序。
+    每条线段只检查其中心锚点，不再沿线滑动。若当前线段过窄、越界或
+    回撤后的 32×15 mm 足迹覆盖其他物体，则继续尝试下一线段。
+    """
+    if filtered_edge_mask is None:
+        return None, {
+            'segment_count': 0,
+            'wide_segment_count': 0,
+            'feasible_segment_count': 0,
+            'selected_segment_index': None,
+            'selected_segment_range': None,
+            'selected_segment_mask': None,
+            'geometry_invalid_reason': 'no_filtered_edge',
+        }
+
+    empty_debug = {
+        'segment_count': 0,
+        'wide_segment_count': 0,
+        'feasible_segment_count': 0,
+        'selected_segment_index': None,
+        'selected_segment_range': None,
+        'selected_segment_mask': np.zeros_like(filtered_edge_mask, dtype=bool),
+    }
+    if not np.any(filtered_edge_mask > 0):
+        empty_debug['geometry_invalid_reason'] = 'no_filtered_edge'
+        return None, empty_debug
+
+    edge_v, edge_u = np.where(filtered_edge_mask > 0)
+    edge_points = np.column_stack((edge_u, edge_v)).astype(np.float32)
+    angle_rad = np.radians(float(push_angle_deg))
+    du, dv = float(np.cos(angle_rad)), float(np.sin(angle_rad))
+    tu, tv = -dv, du
+
+    projections = edge_points[:, 0] * tu + edge_points[:, 1] * tv
+    center_projection = float(center_u) * tu + float(center_v) * tv
+    sorted_projections = np.sort(projections)
+    gap_threshold_px = float(EDGE_SEGMENT_GAP_M * PPM)
+
+    clusters = []
+    current_cluster = [float(sorted_projections[0])]
+    for idx in range(1, len(sorted_projections)):
+        value = float(sorted_projections[idx])
+        if value - float(sorted_projections[idx - 1]) > gap_threshold_px:
+            clusters.append(current_cluster)
+            current_cluster = [value]
+        else:
+            current_cluster.append(value)
+    clusters.append(current_cluster)
+
+    # sim-ur10 首先选择中心最靠近质心的线段。为适配当前夹爪，这里按
+    # 同一距离排序逐条验证，最近线段不可执行时才尝试下一条。
+    ranked_clusters = []
+    for original_index, cluster in enumerate(clusters):
+        segment_center = 0.5 * (cluster[0] + cluster[-1])
+        ranked_clusters.append((
+            abs(segment_center - center_projection),
+            original_index,
+            cluster,
+            segment_center,
+        ))
+    ranked_clusters.sort(key=lambda item: (item[0], item[1]))
+
+    object_mask = _ensure_uint8_mask(object_mask)
+    global_mask = _ensure_uint8_mask(global_mask)
+    other_mask = np.zeros_like(filtered_edge_mask, dtype=bool)
+    if global_mask is not None:
+        other_mask = (global_mask > 0) & ~(
+            object_mask > 0 if object_mask is not None else False
+        )
+
+    h, w = filtered_edge_mask.shape
+    min_segment_width_px = float(GRIPPER_LATERAL_M * PPM)
+    half_lateral_px = 0.5 * min_segment_width_px
+    half_push_px = 0.5 * float(GRIPPER_PUSH_AXIS_M * PPM)
+    retreat_px = float(0.005 * PPM)
+    half_u_px = abs(tu) * half_lateral_px + abs(du) * half_push_px
+    half_v_px = abs(tv) * half_lateral_px + abs(dv) * half_push_px
+    wide_segment_count = sum(
+        float(cluster[-1] - cluster[0]) >= min_segment_width_px
+        for cluster in clusters
+    )
+    feasible_segment_count = 0
+
+    for _, original_index, cluster, segment_center in ranked_clusters:
+        segment_width_px = float(cluster[-1] - cluster[0])
+        if segment_width_px < min_segment_width_px:
+            continue
+
+        # 将线段中心吸附到最近的真实横向投影，再取对应的实际边缘像素。
+        target_projection = projections[np.argmin(np.abs(projections - segment_center))]
+        contact_index = int(np.argmin(np.abs(projections - target_projection)))
+        contact_u, contact_v = edge_points[contact_index]
+        push_u = float(contact_u - du * retreat_px)
+        push_v = float(contact_v - dv * retreat_px)
+
+        if (
+            push_u - half_u_px < 0.0
+            or push_u + half_u_px > w - 1
+            or push_v - half_v_px < 0.0
+            or push_v + half_v_px > h - 1
+        ):
+            continue
+
+        # 当前仅支持 C4，足迹在图像中始终轴对齐。使用像素中心判断
+        # 32×15 mm 矩形内是否存在任何非意图物体。
+        u_min = max(0, int(np.ceil(push_u - half_u_px)))
+        u_max = min(w - 1, int(np.floor(push_u + half_u_px)))
+        v_min = max(0, int(np.ceil(push_v - half_v_px)))
+        v_max = min(h - 1, int(np.floor(push_v + half_v_px)))
+        if np.any(other_mask[v_min:v_max + 1, u_min:u_max + 1]):
+            continue
+
+        feasible_segment_count += 1
+        selected_segment_mask = (
+            (projections >= float(cluster[0]))
+            & (projections <= float(cluster[-1]))
+        )
+        selected_mask_image = np.zeros_like(filtered_edge_mask, dtype=bool)
+        selected_points = edge_points[selected_segment_mask].astype(np.int32)
+        selected_mask_image[selected_points[:, 1], selected_points[:, 0]] = True
+        return {
+            'contact_pixel': (int(round(contact_u)), int(round(contact_v))),
+            'push_pixel_float': (push_u, push_v),
+        }, {
+            'segment_count': int(len(clusters)),
+            'wide_segment_count': int(wide_segment_count),
+            'feasible_segment_count': int(feasible_segment_count),
+            'selected_segment_index': int(original_index),
+            'selected_segment_range': (
+                float(cluster[0]), float(cluster[-1])
+            ),
+            'selected_segment_mask': selected_mask_image,
+            'segment_gap_threshold_px': gap_threshold_px,
+        }
+
+    reason = (
+        'no_segment_wide_enough'
+        if wide_segment_count == 0
+        else 'no_collision_free_gripper_window'
+    )
+    empty_debug.update({
+        'segment_count': int(len(clusters)),
+        'wide_segment_count': int(wide_segment_count),
+        'feasible_segment_count': int(feasible_segment_count),
+        'segment_gap_threshold_px': gap_threshold_px,
+        'geometry_invalid_reason': reason,
+    })
+    return None, empty_debug
+
+
+def _compute_migrated_edge_push(depth_map, object_mask, center_u, center_v,
+                                push_angle_deg, global_mask=None,
+                                debug_info=None):
+    """执行迁移后的边缘过滤、线段锚点和最高边缘高度推点算法。"""
+    depth = np.asarray(depth_map, dtype=np.float32)
+    depth = np.nan_to_num(depth, nan=CAMERA_Z, posinf=CAMERA_Z, neginf=CAMERA_Z)
+    object_mask = _ensure_uint8_mask(object_mask)
+    if debug_info is not None:
+        debug_info.clear()
+
+    edge_mask, edge_points = _extract_rear_edge_for_direction(object_mask, push_angle_deg)
+    filtered_mask, filtered_points, neighborhood_mask, deleted_mask = _filter_edge_by_height_30mm(
+        edge_mask, edge_points, global_mask, object_mask, depth
+    )
+    result, selection_debug = _select_sim_ur10_edge_anchor(
+        filtered_mask,
+        object_mask,
+        global_mask,
+        center_u,
+        center_v,
+        push_angle_deg,
     )
 
-    dilate_radius_px = int(0.04 * PPM)
-    kernel_dilate = np.ones((dilate_radius_px * 2 + 1, dilate_radius_px * 2 + 1), np.uint8)
-    object_dilated = cv2.dilate(object_mask, kernel_dilate, iterations=1)
+    if debug_info is not None:
+        debug_info.update({
+            'raw_edge_mask': edge_mask > 0,
+            'candidate_mask': filtered_mask > 0,
+            'edge_neighborhood_mask': neighborhood_mask,
+            'height_deleted_mask': deleted_mask,
+            'selected_from_candidates': result is not None,
+        })
+        debug_info.update(selection_debug)
 
-    search_mask = (object_dilated > 0) & (sector_mask > 0)
-    if np.sum(search_mask) == 0:
-        search_mask = sector_mask > 0
+    if result is None:
+        if debug_info is not None:
+            debug_info['geometry_invalid_reason'] = selection_debug.get(
+                'geometry_invalid_reason', 'no_valid_edge_segment'
+            )
+        return None
 
-    gripper_h_px = int(0.032 * PPM)
-    gripper_w_px = int(0.02 * PPM)
+    # 高度采样使用全部高度过滤后边缘，并沿推动方向向物体内部偏移约 9 mm。
+    inward_px = max(1, int(np.ceil(EDGE_INWARD_SAMPLE_M * PPM)))
+    du, dv = _cardinal_push_step(push_angle_deg)
+    edge_depths = []
+    for u, v in filtered_points:
+        sample_u = int(np.clip(u + du * inward_px, 0, depth.shape[1] - 1))
+        sample_v = int(np.clip(v + dv * inward_px, 0, depth.shape[0] - 1))
+        value = float(depth[sample_v, sample_u])
+        if np.isfinite(value) and 0.0 < value < 1.9:
+            edge_depths.append(value)
 
-    if push_angle_deg % 180 == 0:
-        k_rows, k_cols = gripper_h_px, gripper_w_px
-    else:
-        k_rows, k_cols = gripper_w_px, gripper_h_px
+    if not edge_depths:
+        if debug_info is not None:
+            debug_info['geometry_invalid_reason'] = 'no_valid_edge_depth'
+        return None
 
-    kernel_roi = np.ones((k_rows, k_cols), np.uint8)
-    eroded_depth = cv2.erode(depth_map, kernel_roi, iterations=1)
+    # 深度越小代表物理高度越高。与 sim-ur10 一致，使用全部绿色过滤
+    # 边缘中的最高高度，而不是均值或仅选中线段的高度。
+    max_edge_height = CAMERA_Z - float(np.min(edge_depths))
+    push_z = max(max_edge_height - EDGE_HEIGHT_OFFSET_M, EDGE_HEIGHT_FLOOR_M)
+    push_u, push_v = result['push_pixel_float']
+    contact_u, contact_v = result['contact_pixel']
+    selected_depth = float(depth[contact_v, contact_u])
 
-    max_allowed_height = 0.15
-    min_allowed_depth = CAMERA_Z - max_allowed_height
-    safe_mask = (eroded_depth >= min_allowed_depth) & search_mask
+    if debug_info is not None:
+        debug_info.update({
+            'selected_contact_pixel': result['contact_pixel'],
+            'push_pixel_float': (push_u, push_v),
+            'edge_max_height': float(max_edge_height),
+            'edge_height_sample_count': int(len(edge_depths)),
+            'push_z': float(push_z),
+        })
+    return push_u, push_v, push_z, selected_depth
 
-    masked_score = eroded_depth.copy()
-    masked_score[~safe_mask] = -1.0
-
-    best_idx = np.argmax(masked_score)
-    push_v, push_u = np.unravel_index(best_idx, depth_map.shape)
-    push_depth_val = eroded_depth[push_v, push_u]
-
-    if masked_score[push_v, push_u] == -1.0:
-        masked_score_fallback = eroded_depth.copy()
-        masked_score_fallback[~search_mask] = -1.0
-        best_idx = np.argmax(masked_score_fallback)
-        push_v, push_u = np.unravel_index(best_idx, depth_map.shape)
-        push_depth_val = eroded_depth[push_v, push_u]
-
-        if masked_score_fallback[push_v, push_u] == -1.0:
-            push_u, push_v = center_u, center_v
-            push_depth_val = center_depth
-
-    max_height_in_roi = CAMERA_Z - push_depth_val
-    push_z = max_height_in_roi + TARGET_PUSH_SAFETY_MARGIN
-    push_z = max(0.03, min(push_z, 0.15))
-
-    return push_u, push_v, push_z, push_depth_val
-
-
-def _compute_legacy_obstacle_push(depth_map, center_u, center_v, center_depth):
-    """Keep the old 4-7 behavior for no-hit fallback."""
-    gripper_h_px = int(0.032 * PPM)
-    gripper_w_px = int(0.02 * PPM)
-
-    h_map, w_map = depth_map.shape
-    v_min = max(0, int(center_v - gripper_h_px // 2))
-    v_max = min(h_map, int(center_v + gripper_h_px // 2))
-    u_min = max(0, int(center_u - gripper_w_px // 2))
-    u_max = min(w_map, int(center_u + gripper_w_px // 2))
-
-    roi_depth = depth_map[v_min:v_max, u_min:u_max]
-    min_depth_roi = np.min(roi_depth) if roi_depth.size > 0 else center_depth
-
-    max_height_in_roi = CAMERA_Z - min_depth_roi
-    push_z = max_height_in_roi + LEGACY_OBSTACLE_SAFETY_MARGIN
-    push_z = max(0.03, min(push_z, 0.15))
-
-    return center_u, center_v, push_z, center_depth
 
 
 def _find_dominant_obstacle_mask(seg_map, target_mask, global_mask, center_u, center_v,
@@ -340,7 +597,8 @@ def _model_id_for_prim_path(prim_path, spawned_objects):
     return None
 
 
-def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_objects):
+def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_objects,
+                                   debug_info=None):
     """
     根据离散动作索引计算推点和推动方向
     
@@ -357,77 +615,30 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
         push_point: (3,) tensor - 世界坐标推点 (x, y, z)
         direction_idx: int (0-3) - 推动方向索引
     """
-    # [优化] 只获取一次图像，避免重复隐藏机械臂
-    # 使用normalize_depth=False获取米制深度图，同时获取分割图
-    images = state.get_img(hide_robot=True, normalize_depth=False)
+    # 直接复用生成网络输入状态时缓存的同一帧。缓存中的 depth_map 是米制
+    # float 深度，而网络使用的是由它归一化得到的 uint8 深度通道。
+    # 此处禁止重新调用相机，否则推点对应的场景可能与网络评价动作时不同。
+    images = state.get_cached_observation_images()
     if images is None:
-        raise ValueError(f"Env {env_idx}: 无法获取图像")
+        raise ValueError(
+            f"Env {env_idx}: 缺少网络观测帧缓存；"
+            "请先通过 State.get_state() 获取网络输入，再计算推点"
+        )
     
-    rgb, depth_map, seg_map = images  # depth_map 是米制深度(float)
-    
-    # 使用state的方法获取正确的target_mask
-    target_mask = state.extract_target_mask(seg_map, spawned_objects)
-    
-    # [Mod] 创建全局物体掩膜（通过投影物体中心点来识别前景ID）
-    # 之前直接 seg_map > 0 会包含背景（如果背景ID非0），导致由于全白
-    global_mask = np.zeros_like(seg_map, dtype=np.uint8)
-    
-    detected_ids = set()
-    if spawned_objects:
-        for obj in spawned_objects:
-            try:
-                # 获取物体位置 (tensor -> numpy)
-                if not hasattr(obj, 'data') or obj.data.root_pos_w is None:
-                    continue
-                    
-                pos_3d = obj.data.root_pos_w[0]
-                if isinstance(pos_3d, torch.Tensor):
-                    pos_3d = pos_3d.cpu().numpy()
-                
-                # 转换到像素坐标
-                u, v = state.world_to_pixel([pos_3d[0], pos_3d[1]])
-                
-                # 边界检查
-                h, w = seg_map.shape
-                if 0 <= u < w and 0 <= v < h:
-                    obj_id = seg_map[v, u]
-                    # 只有当ID有效且未添加时处理
-                    if obj_id > 0: # 假设0是空/无效
-                        global_mask[seg_map == obj_id] = 255
-                        detected_ids.add(obj_id)
-            except Exception as e:
-                # 忽略单个物体的错误
-                continue
-    
-    # 如果没找到任何物体（可能是投影误差），尝试使用面积排除法作为Fallback
-    if len(detected_ids) == 0:
-        print(f"⚠ [Env{env_idx}] 无法通过投影识别物体，使用最大面积排除法作为Global Mask")
-        vals, counts = np.unique(seg_map, return_counts=True)
-        if len(vals) > 0:
-            # 假设面积最大的ID是背景
-            bg_id = vals[np.argmax(counts)]
-            global_mask[seg_map != bg_id] = 255
-        else:
-            global_mask = (seg_map > 0).astype(np.uint8) * 255
-            
-    # 调试日志
-    # print(f"[调试] Global Mask IDs: {detected_ids}, Sum: {global_mask.sum()}")
-    
-    # 如果Target Mask提取失败，使用Global Mask的一部分作为Fallback
-    if target_mask is None or np.sum(target_mask > 0) == 0:
-        print(f"❌ [Env{env_idx}] target_mask提取失败，使用中心区域Fallback")
-        target_mask = np.zeros_like(global_mask)
-        h, w = depth_map.shape
-        # 如果 global mask 有内容，用从 global mask 里取一部分？ 
-        # 暂时还是用中心矩形，稳妥
-        target_mask[h//4:3*h//4, w//4:3*w//4] = 255
-    else:
-        # 确保mask是uint8
-        if target_mask.dtype != np.uint8:
-            target_mask = (target_mask * 255).astype(np.uint8) if target_mask.max() <= 1 else target_mask.astype(np.uint8)
-            
-    if global_mask.dtype != np.uint8:
-        global_mask = (global_mask * 255).astype(np.uint8) if global_mask.max() <= 1 else global_mask.astype(np.uint8)
+    _rgb, depth_map, seg_map = images  # depth_map 是米制深度(float)
+
+    # 掩膜也直接复用生成网络第 2/3 通道时的数组，不再二次
+    # 投影物体中心或重新判断背景，避免“同帧但掩膜不同”。
+    masks = state.get_cached_observation_masks()
+    if masks is None:
+        raise ValueError(f"Env {env_idx}: 缺少网络观测掩膜缓存")
+    target_mask, global_mask = masks
+    target_mask = _ensure_uint8_mask(target_mask)
+    global_mask = _ensure_uint8_mask(global_mask)
+    if target_mask is None or not np.any(target_mask > 0):
+        raise ValueError(f"Env {env_idx}: 网络观测中的目标物体掩膜为空")
+    if global_mask is None:
+        global_mask = np.zeros_like(target_mask, dtype=np.uint8)
     
     target_id, background_id = _infer_target_and_background_id(seg_map, target_mask)
 
@@ -442,14 +653,25 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
     # [点1] 记录该动作"第一下应该碰到的物体" seg id, 供 env_wrapper 的接触判定使用。
     #   推目标 (0-3): intended = target_id
     #   推障碍 (4-7): intended = 选中的 dominant 障碍 id (无则 -1)
+    geometry_debug = {} if debug_info is not None else None
+    geometry_invalid_reason = None
     if action_idx <= 3:
         # ===== 推目标物体 =====
         direction_idx = action_idx
         push_angle_deg = _get_push_angle_deg(direction_idx)
-        push_u, push_v, push_z, _ = _compute_safe_push_from_mask(
-            depth_map, target_mask, center_u, center_v, push_angle_deg, center_depth
+        migrated_result = _compute_migrated_edge_push(
+            depth_map, target_mask, center_u, center_v, push_angle_deg,
+            global_mask=global_mask, debug_info=geometry_debug
         )
+        if migrated_result is None:
+            push_u = push_v = push_z = None
+            geometry_invalid_reason = geometry_debug.get(
+                'geometry_invalid_reason', 'no_valid_edge_segment'
+            ) if geometry_debug is not None else 'no_valid_edge_segment'
+        else:
+            push_u, push_v, push_z, _ = migrated_result
         intended_seg_id = int(target_id)
+        intended_mask = target_mask
     else:
         # ===== 推障碍物 =====
         direction_idx = action_idx - 4
@@ -471,23 +693,53 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
             if obstacle_center is not None:
                 obstacle_u, obstacle_v = obstacle_center
                 obstacle_depth = depth_map[obstacle_v, obstacle_u]
-                push_u, push_v, push_z, _ = _compute_safe_push_from_mask(
+                migrated_result = _compute_migrated_edge_push(
                     depth_map,
                     dominant_obstacle_mask,
                     obstacle_u,
                     obstacle_v,
                     push_angle_deg,
-                    obstacle_depth,
+                    global_mask=global_mask,
+                    debug_info=geometry_debug,
                 )
+                if migrated_result is None:
+                    push_u = push_v = push_z = None
+                    geometry_invalid_reason = geometry_debug.get(
+                        'geometry_invalid_reason', 'no_valid_edge_segment'
+                    ) if geometry_debug is not None else 'no_valid_edge_segment'
+                else:
+                    push_u, push_v, push_z, _ = migrated_result
             else:
-                push_u, push_v, push_z, _ = _compute_legacy_obstacle_push(
-                    depth_map, center_u, center_v, center_depth
-                )
+                push_u = push_v = push_z = None
+                geometry_invalid_reason = 'no_dominant_obstacle'
+                if geometry_debug is not None:
+                    geometry_debug.clear()
+                    geometry_debug.update({
+                        'candidate_mask': np.zeros_like(target_mask, dtype=bool),
+                        'edge_neighborhood_mask': np.zeros_like(target_mask, dtype=bool),
+                        'selected_from_candidates': False,
+                        'geometry_invalid_reason': geometry_invalid_reason,
+                    })
         else:
-            push_u, push_v, push_z, _ = _compute_legacy_obstacle_push(
-                depth_map, center_u, center_v, center_depth
-            )
-        intended_seg_id = int(dominant_seg_id)  # -1 表示未选到障碍 (走 legacy fallback)
+            push_u = push_v = push_z = None
+            geometry_invalid_reason = 'no_dominant_obstacle'
+            if geometry_debug is not None:
+                geometry_debug.clear()
+                geometry_debug.update({
+                    'candidate_mask': np.zeros_like(target_mask, dtype=bool),
+                    'edge_neighborhood_mask': np.zeros_like(target_mask, dtype=bool),
+                    'selected_from_candidates': False,
+                    'geometry_invalid_reason': geometry_invalid_reason,
+                })
+        intended_seg_id = int(dominant_seg_id)  # -1 表示未选到障碍，动作几何无效
+        intended_mask = (
+            dominant_obstacle_mask
+            if dominant_obstacle_mask is not None
+            else np.zeros_like(target_mask, dtype=np.uint8)
+        )
+
+    # 没有安全几何推点时不产生任何默认运动点，由环境按空推处理。
+    geometry_valid = push_u is not None and push_v is not None and push_z is not None
 
     # 转换为世界坐标
     # [Fix] 坐标系修复：根据State.world_to_pixel的定义
@@ -495,8 +747,11 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
     # v = 160 + int((x_local - 0.75) * PPM)   -> v 对应 World X
     
     # 从像素反推局部坐标
-    y_local = (push_u - 160.0) / PPM
-    x_local = (push_v - 160.0) / PPM + 0.75
+    if geometry_valid:
+        y_local = (float(push_u) - 160.0) / PPM
+        x_local = (float(push_v) - 160.0) / PPM + 0.75
+    else:
+        y_local = x_local = 0.0
     
     # 获取环境偏移
     env_offset_x, env_offset_y = scene.get_env_offset(env_idx)
@@ -504,12 +759,14 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
     # 加上环境偏移得到世界坐标
     push_x = x_local + env_offset_x
     push_y = y_local + env_offset_y
-    
-    push_point = torch.tensor([push_x, push_y, push_z], dtype=torch.float32, device='cuda')
+
+    push_point = None
+    if geometry_valid:
+        push_point = torch.tensor([push_x, push_y, push_z], dtype=torch.float32, device='cuda')
 
     # [点1] 接触判定所需信息: 该动作"意图碰到的物体" prim_path + 动作类型。
     #   env_wrapper 用 PhysX 成对接触列拿到“第一下实际碰到的刚体 prim_path”，与此比对。
-    #   intended_prim_path=None 表示未选到明确物体 (如推障碍时没选到 dominant, 走 legacy)。
+    #   intended_prim_path=None 表示未选到明确物体（例如没有主障碍物）。
     if action_idx <= 3:
         # 推目标不需要经过分割 ID 反查；Target_* 对象引用就是唯一意图实体。
         intended_prim_path = next(
@@ -528,6 +785,29 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
         'intended_prim_path': intended_prim_path,
         'intended_model_id': _model_id_for_prim_path(intended_prim_path, spawned_objects),
         'kind': 'target' if action_idx <= 3 else 'obstacle',
+        'geometry_valid': bool(geometry_valid),
+        'geometry_invalid_reason': geometry_invalid_reason,
     }
+
+    if debug_info is not None:
+        debug_info.clear()
+        debug_info.update(geometry_debug or {})
+        debug_info.update({
+            'rgb': _rgb,
+            'depth_map': depth_map,
+            'seg_map': seg_map,
+            'target_mask': target_mask,
+            'global_mask': global_mask,
+            'intended_mask': intended_mask,
+            'push_pixel': (
+                int(round(push_u)), int(round(push_v))
+            ) if geometry_valid else None,
+            'push_pixel_float': (float(push_u), float(push_v)) if geometry_valid else None,
+            'push_z': float(push_z) if geometry_valid else None,
+            'direction_idx': int(direction_idx),
+            'intended_seg_id': int(intended_seg_id),
+            'geometry_valid': bool(geometry_valid),
+            'geometry_invalid_reason': geometry_invalid_reason,
+        })
 
     return push_point, direction_idx, contact_spec

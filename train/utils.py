@@ -23,7 +23,7 @@ def format_contact_action(info):
 
 
 def format_push_effectiveness(info):
-    """展示物理质心位移与意图物体峰值接触力的空推判定。"""
+    """展示“接触力 AND (质心位移 OR 旋转边缘位移)”空推判定。"""
     is_empty = info.get('empty_push', False)
     metrics = info.get('empty_metrics') or {}
     if not metrics:
@@ -31,15 +31,24 @@ def format_push_effectiveness(info):
 
     displacement = float(metrics.get('displacement_m', 0.0))
     displacement_threshold = float(metrics.get('displacement_threshold_m', 0.01))
+    rotation_arc = float(metrics.get('rotation_arc_m', 0.0))
+    rotation_arc_threshold = float(metrics.get('rotation_arc_threshold_m', 0.01))
+    rotation_theta = metrics.get('rotation_theta_rad')
+    rotation_radius = metrics.get('rotation_radius_m')
     peak_force = float(metrics.get('peak_contact_force_n', 0.0))
     force_threshold = float(metrics.get('force_threshold_n', 1.0))
     displacement_mark = '✓' if metrics.get('displacement_ok', False) else '×'
+    rotation_mark = '✓' if metrics.get('rotation_ok', False) else '×'
     force_mark = '✓' if metrics.get('force_ok', False) else '×'
+    theta_text = f'{float(rotation_theta):.4f}rad' if rotation_theta is not None else '不可用'
+    radius_text = f'{float(rotation_radius):.4f}m' if rotation_radius is not None else '不可用'
     reason = metrics.get('reason', 'unknown')
     return (
         f"推动判定: {'⚠ 空推' if is_empty else '✓ 有效'} "
-        f"(质心XY位移={displacement:.4f}m/{displacement_threshold:.4f}m {displacement_mark}, "
-        f"峰值力={peak_force:.3f}N/{force_threshold:.3f}N {force_mark}, 原因={reason})"
+        f"(峰值力={peak_force:.3f}N/{force_threshold:.3f}N {force_mark} AND "
+        f"[质心XY位移={displacement:.4f}m/{displacement_threshold:.4f}m {displacement_mark} "
+        f"OR 旋转S={rotation_arc:.4f}m/{rotation_arc_threshold:.4f}m {rotation_mark} "
+        f"(theta={theta_text}, D={radius_text})], 原因={reason})"
     )
 
 

@@ -6,7 +6,7 @@ PUBLIC_IP=172.21.100.11 LIVESTREAM=2 CUDA_VISIBLE_DEVICES=6 \
 ./isaaclab.sh -p scripts/Dexisaac/train/train.py \
   --task_sampling random \
   --task_batch_size 4 \
-  --n_meta_iterations 150 \
+  --n_meta_iterations 300 \
   --epsilon_query 0.0 \
   --no-load_model \
   "$@"

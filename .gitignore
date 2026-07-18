@@ -10,7 +10,7 @@ pyrightconfig.json
 dexterous_hand_research_report.md
 debug/
 tests/
-test7_14.py
+test_empty_push.py
 modify_bug.md
 # 忽略模型文件
 assets/

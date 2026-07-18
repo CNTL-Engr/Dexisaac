@@ -304,6 +304,10 @@ class Scene:
         from isaaclab.assets import RigidObject, RigidObjectCfg
         import isaaclab.sim as sim_utils
 
+        # 保留 wrapper 替换前的原始模型路径。空推旋转检测需要从同目录
+        # textured.obj 读取真实网格顶点；071 的仿真 USD 会在下方替换成 wrapper。
+        source_usd_path = usd_path
+
         # 071 是唯一“引用根为容器、真实刚体在 Root/textured”的模型。
         # 静态 wrapper 直接把真实刚体作为 default prim；保留质量和视觉内容，
         # 用离线低面数凸包替代异常高面数碰撞网格，使根路径可作为精确 filter。
@@ -357,6 +361,7 @@ class Scene:
         )
         
         obj = RigidObject(obj_cfg)
+        obj.source_usd_path = source_usd_path
         
         return obj
 
@@ -969,7 +974,16 @@ class Scene:
                         force_task_config['obstacle_count'] = n_obstacles
                         force_task_config.setdefault('target_pos', [0.75, 0.0, 0.06])
 
-                    target_model_name = random.choice(available_target_models)
+                    requested_target_model = force_task_config.get('target_model')
+                    if requested_target_model is not None:
+                        target_model_name = str(requested_target_model)
+                        if target_model_name not in available_target_models:
+                            raise ValueError(
+                                f"指定目标模型不存在或缺少 textured.usd: "
+                                f"{os.path.join(ycb_target_root, target_model_name)}"
+                            )
+                    else:
+                        target_model_name = random.choice(available_target_models)
                     available_obstacle_models = [m for m in available_models if m != target_model_name]
                     if len(available_obstacle_models) < n_obstacles:
                         raise RuntimeError(
