@@ -15,6 +15,15 @@ def format_contact_action(info):
     if status == 'illegal':
         return f'准备推"{intended}"  实际碰撞"{actual or "未知"}"'
 
+    if status == 'empty':
+        return f'准备推"{intended}"  空推({info.get("empty_reason") or "unknown"})'
+
+    if status == 'invalid_geometry':
+        return (
+            f'准备推"{intended}"  几何无效失败('
+            f'{info.get("geometry_invalid_reason") or "unknown"})'
+        )
+
     if status in ('no_contact', 'unavailable'):
         actual = '未接触'
     else:
@@ -23,7 +32,7 @@ def format_contact_action(info):
 
 
 def format_push_effectiveness(info):
-    """展示“接触力 AND (质心位移 OR 旋转边缘位移)”空推判定。"""
+    """展示“接触力 AND (质心位移 OR 旋转弧长 OR 旋转角度)”判定。"""
     is_empty = info.get('empty_push', False)
     metrics = info.get('empty_metrics') or {}
     if not metrics:
@@ -34,13 +43,21 @@ def format_push_effectiveness(info):
     rotation_arc = float(metrics.get('rotation_arc_m', 0.0))
     rotation_arc_threshold = float(metrics.get('rotation_arc_threshold_m', 0.01))
     rotation_theta = metrics.get('rotation_theta_rad')
+    rotation_angle_threshold = float(
+        metrics.get('rotation_angle_threshold_rad', 0.2)
+    )
     rotation_radius = metrics.get('rotation_radius_m')
     peak_force = float(metrics.get('peak_contact_force_n', 0.0))
     force_threshold = float(metrics.get('force_threshold_n', 1.0))
     displacement_mark = '✓' if metrics.get('displacement_ok', False) else '×'
-    rotation_mark = '✓' if metrics.get('rotation_ok', False) else '×'
+    rotation_mark = '✓' if metrics.get('rotation_arc_ok', metrics.get('rotation_ok', False)) else '×'
+    rotation_angle_mark = '✓' if metrics.get('rotation_angle_ok', False) else '×'
     force_mark = '✓' if metrics.get('force_ok', False) else '×'
     theta_text = f'{float(rotation_theta):.4f}rad' if rotation_theta is not None else '不可用'
+    theta_threshold_text = (
+        f'{rotation_angle_threshold:.4f}rad'
+        f'({rotation_angle_threshold * 180.0 / 3.141592653589793:.2f}°)'
+    )
     radius_text = f'{float(rotation_radius):.4f}m' if rotation_radius is not None else '不可用'
     reason = metrics.get('reason', 'unknown')
     return (
@@ -48,7 +65,8 @@ def format_push_effectiveness(info):
         f"(峰值力={peak_force:.3f}N/{force_threshold:.3f}N {force_mark} AND "
         f"[质心XY位移={displacement:.4f}m/{displacement_threshold:.4f}m {displacement_mark} "
         f"OR 旋转S={rotation_arc:.4f}m/{rotation_arc_threshold:.4f}m {rotation_mark} "
-        f"(theta={theta_text}, D={radius_text})], 原因={reason})"
+        f"OR theta={theta_text}>{theta_threshold_text} {rotation_angle_mark} "
+        f"(D={radius_text})], 原因={reason})"
     )
 
 

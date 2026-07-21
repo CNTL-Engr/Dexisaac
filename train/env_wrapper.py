@@ -60,18 +60,26 @@ class PushEnv(SuccessSeparationMixin):
         self.empty_push_rotation_arc_threshold = float(
             getattr(args, 'empty_push_rotation_arc_threshold', 0.01)
         )
+        self.empty_push_rotation_angle_threshold = float(
+            getattr(args, 'empty_push_rotation_angle_threshold', 0.2)
+        )
         if (
             not np.isfinite(self.empty_push_rotation_arc_threshold)
             or self.empty_push_rotation_arc_threshold < 0.0
         ):
             raise ValueError('empty_push_rotation_arc_threshold 必须是大于等于 0 的有限值')
+        if (
+            not np.isfinite(self.empty_push_rotation_angle_threshold)
+            or self.empty_push_rotation_angle_threshold < 0.0
+        ):
+            raise ValueError('empty_push_rotation_angle_threshold 必须是大于等于 0 的有限值')
         # D 对同一“源网格 + spawn 缩放 + 物理质心”保持不变，跨环境和
         # episode 复用，避免反复扫描体积较大的 textured.obj。
         self._mesh_xy_radius_cache = {}
         # 动力学崩飞检测：只使用物体的三维总线速度和三维总线加速度。
         # 阈值由所有训练/评估入口显式传入；getattr 默认值兼容诊断脚本的简化 Args。
         self.explosion_linear_speed_threshold = float(
-            getattr(args, 'explosion_linear_speed_threshold', 1.0)
+            getattr(args, 'explosion_linear_speed_threshold', 3.0)
         )
         self.explosion_linear_acceleration_threshold = float(
             getattr(args, 'explosion_linear_acceleration_threshold', 50.0)
@@ -112,6 +120,10 @@ class PushEnv(SuccessSeparationMixin):
         self.previous_actions = [None for _ in range(self.num_envs)]
         self.opposite_action_streaks = [0 for _ in range(self.num_envs)]
         self.previous_empty_pushes = [False for _ in range(self.num_envs)]
+        # Invalid-action suppression (IAS) is owned by the environment so
+        # train/eval/MAML observe identical per-environment behavior.
+        self.invalid_actions_by_env = [set() for _ in range(self.num_envs)]
+        self.ias_exhausted = [False for _ in range(self.num_envs)]
         self.num_objects_min = args.num_objects_min
         self.num_objects_max = args.num_objects_max
 
@@ -122,7 +134,7 @@ class PushEnv(SuccessSeparationMixin):
         # tracker 为 None (关闭/未启用) 时此集合恒空 → 非法接触检查是无害的 no-op。
         self.illegal_contact_envs = {}  # env_idx -> info dict
         # 每步动作的统一接触结果，供训练/评估输出“准备推谁、实际碰到谁”。
-        # status: no_contact | legal | illegal | unavailable | invalid_geometry
+        # status: no_contact | legal | illegal | unavailable | invalid_geometry | empty
         self.action_contact_results = {}  # env_idx -> info dict
 
         # [点1-调试] 接触事件原始记录 (仅供 inspect_sim 等调试脚本消费, 训练时默认关闭)。
@@ -180,6 +192,8 @@ class PushEnv(SuccessSeparationMixin):
         self.previous_actions = [None for _ in range(self.num_envs)]
         self.opposite_action_streaks = [0 for _ in range(self.num_envs)]
         self.previous_empty_pushes = [False for _ in range(self.num_envs)]
+        self.invalid_actions_by_env = [set() for _ in range(self.num_envs)]
+        self.ias_exhausted = [False for _ in range(self.num_envs)]
 
         # 清空IK失败黑名单
         self.ik_failed_blacklist.clear()
@@ -212,6 +226,24 @@ class PushEnv(SuccessSeparationMixin):
         states = self._get_observations(spawned_objects)
 
         return states, spawned_objects
+
+    def get_invalid_actions(self, env_idx):
+        """Return the current episode's IAS list for one environment."""
+        return sorted(int(action) for action in self.invalid_actions_by_env[env_idx])
+
+    def _update_invalid_action_state(self, env_idx, action, outcome):
+        """Update IAS after one action and report whether IAS exhausted all actions."""
+        if outcome == 'empty':
+            self.invalid_actions_by_env[env_idx].add(int(action))
+            exhausted = len(self.invalid_actions_by_env[env_idx]) >= 8
+            self.ias_exhausted[env_idx] = exhausted
+            return exhausted
+        if outcome == 'push':
+            # A successful/non-empty action changes the scene, so previous
+            # empty-action conclusions are no longer guaranteed to hold.
+            self.invalid_actions_by_env[env_idx].clear()
+            self.ias_exhausted[env_idx] = False
+        return False
 
     def step(self, actions, spawned_objects):
         """
@@ -410,8 +442,42 @@ class PushEnv(SuccessSeparationMixin):
                     action_idx, env_idx, state, self.scene, env_objects
                 )
 
-                # 几何算法明确判定为空推时，不生成默认推点，也不进入机器人轨迹。
-                # 后续奖励层通过 action_contact_results / 缺失运动测量沿用当前空推惩罚。
+                outcome = (
+                    contact_spec.get('outcome', 'invalid_geometry')
+                    if contact_spec is not None else 'invalid_geometry'
+                )
+
+                # 空推不执行轨迹，但保留标准空推动作结果并加入 IAS。
+                if outcome == 'empty':
+                    exhausted = self._update_invalid_action_state(
+                        env_idx, action_idx, 'empty'
+                    )
+                    self.action_push_measurements[env_idx] = {
+                        'intended_prim_path': None,
+                        'intended_model_id': None,
+                        'peak_contact_force_n': 0.0,
+                        'contact_available': False,
+                        'predeclared_empty': True,
+                        'empty_reason': contact_spec.get(
+                            'empty_reason', 'empty_push'
+                        ),
+                    }
+                    self.action_contact_results[env_idx] = {
+                        'status': 'empty',
+                        'empty_push': True,
+                        'empty_reason': contact_spec.get(
+                            'empty_reason', 'empty_push'
+                        ),
+                        'ias_exhausted': bool(exhausted),
+                        'intended_model_id': None,
+                        'intended_prim_path': None,
+                        'actual_model_id': None,
+                        'actual_prim_path': None,
+                    }
+                    continue
+
+                # 几何无效时不生成默认推点，也不进入机器人轨迹；奖励层
+                # 将其按非法接触失败处理。
                 if (
                     push_point is None
                     or contact_spec is None
@@ -458,6 +524,7 @@ class PushEnv(SuccessSeparationMixin):
                     }
                     continue
 
+                self._update_invalid_action_state(env_idx, action_idx, 'push')
                 push_points.append(push_point)
                 direction_indices.append(direction_idx)
                 contact_specs.append(contact_spec)
@@ -1030,6 +1097,9 @@ class PushEnv(SuccessSeparationMixin):
             'contact_actual_prim_path': result.get('actual_prim_path'),
             'geometry_invalid': result.get('status') == 'invalid_geometry',
             'geometry_invalid_reason': result.get('geometry_invalid_reason'),
+            'empty_push': result.get('status') == 'empty',
+            'empty_reason': result.get('empty_reason'),
+            'ias_exhausted': result.get('ias_exhausted', False),
         }
 
     def _monitor_dynamics_explosion(self, spawned_objects, phase):
@@ -1410,8 +1480,11 @@ class PushEnv(SuccessSeparationMixin):
         com_available=True,
         rotation_available=True,
         contact_available=True,
+        rotation_theta_rad=0.0,
+        rotation_angle_threshold_rad=0.2,
+        orientation_available=False,
     ):
-        """按 ``接触力 AND (质心位移 OR 旋转边缘位移)`` 判定空推。"""
+        """按 ``接触力 AND (质心位移 OR 旋转弧长 OR 旋转角度)`` 判定。"""
         displacement_ok = bool(
             com_available
             and np.isfinite(displacement_m)
@@ -1422,12 +1495,17 @@ class PushEnv(SuccessSeparationMixin):
             and np.isfinite(rotation_arc_m)
             and rotation_arc_m > rotation_arc_threshold_m
         )
+        rotation_angle_ok = bool(
+            orientation_available
+            and np.isfinite(rotation_theta_rad)
+            and rotation_theta_rad > rotation_angle_threshold_rad
+        )
         force_ok = bool(
             contact_available
             and np.isfinite(peak_force_n)
             and peak_force_n > force_threshold_n
         )
-        movement_ok = displacement_ok or rotation_ok
+        movement_ok = displacement_ok or rotation_ok or rotation_angle_ok
         is_empty = not (target_resolved and force_ok and movement_ok)
 
         if not target_resolved:
@@ -1438,24 +1516,37 @@ class PushEnv(SuccessSeparationMixin):
             reason = 'force_and_movement_below_threshold'
         elif not force_ok:
             reason = 'force_below_threshold'
-        elif displacement_ok and rotation_ok:
+        elif displacement_ok and rotation_ok and not rotation_angle_ok:
             reason = 'valid_by_displacement_and_rotation'
+        elif sum((displacement_ok, rotation_ok, rotation_angle_ok)) > 1:
+            reason = 'valid_by_multiple_motion_signals'
         elif displacement_ok:
             reason = 'valid_by_displacement'
         elif rotation_ok:
             reason = 'valid_by_rotation'
-        elif not com_available and not rotation_available:
+        elif rotation_angle_ok:
+            reason = 'valid_by_rotation_angle'
+        elif not com_available and not orientation_available:
             reason = 'movement_measurement_unavailable'
         elif not com_available:
             reason = 'displacement_unavailable_and_rotation_below_threshold'
+        elif orientation_available and not rotation_available:
+            reason = 'displacement_and_rotation_angle_below_threshold_arc_unavailable'
         elif not rotation_available:
             reason = 'displacement_below_threshold_and_rotation_unavailable'
         else:
             reason = 'displacement_and_rotation_below_threshold'
-        return is_empty, displacement_ok, rotation_ok, force_ok, reason
+        return (
+            is_empty,
+            displacement_ok,
+            rotation_ok,
+            rotation_angle_ok,
+            force_ok,
+            reason,
+        )
 
     def _check_empty_push(self, env_idx):
-        """用“接触力 AND (质心 XY 位移 OR 旋转边缘位移)”判定空推。"""
+        """用“接触力 AND (质心位移 OR 旋转弧长 OR 旋转角度)”判定空推。"""
         measurement = self.action_push_measurements.get(env_idx, {})
         intended_path = measurement.get('intended_prim_path')
         com_before = measurement.get('com_before_w')
@@ -1474,8 +1565,9 @@ class PushEnv(SuccessSeparationMixin):
         rotation_theta_rad = self._minimum_yaw_change(
             yaw_before_rad, yaw_after_rad
         )
+        orientation_available = rotation_theta_rad is not None
         rotation_available = (
-            rotation_theta_rad is not None
+            orientation_available
             and rotation_radius_m is not None
             and np.isfinite(rotation_radius_m)
         )
@@ -1489,18 +1581,26 @@ class PushEnv(SuccessSeparationMixin):
             is_empty,
             displacement_ok,
             rotation_ok,
+            rotation_angle_ok,
             force_ok,
             reason,
         ) = self._evaluate_push_effectiveness(
             displacement_m=displacement_m,
             rotation_arc_m=rotation_arc_m,
+            rotation_theta_rad=(
+                rotation_theta_rad if rotation_theta_rad is not None else 0.0
+            ),
             peak_force_n=peak_force_n,
             displacement_threshold_m=self.empty_push_displacement_threshold,
             rotation_arc_threshold_m=self.empty_push_rotation_arc_threshold,
+            rotation_angle_threshold_rad=(
+                self.empty_push_rotation_angle_threshold
+            ),
             force_threshold_n=self.empty_push_force_threshold,
             target_resolved=target_resolved,
             com_available=com_available,
             rotation_available=rotation_available,
+            orientation_available=orientation_available,
             contact_available=contact_available,
         )
         metrics = {
@@ -1523,6 +1623,9 @@ class PushEnv(SuccessSeparationMixin):
             'yaw_before_rad': yaw_before_rad,
             'yaw_after_rad': yaw_after_rad,
             'rotation_theta_rad': rotation_theta_rad,
+            'rotation_angle_threshold_rad': (
+                self.empty_push_rotation_angle_threshold
+            ),
             'rotation_radius_m': rotation_radius_m,
             'rotation_arc_m': rotation_arc_m,
             'rotation_arc_threshold_m': self.empty_push_rotation_arc_threshold,
@@ -1538,10 +1641,13 @@ class PushEnv(SuccessSeparationMixin):
             'target_resolved': target_resolved,
             'com_available': com_available,
             'rotation_available': rotation_available,
+            'orientation_available': orientation_available,
             'contact_available': contact_available,
             'displacement_ok': displacement_ok,
             'rotation_ok': rotation_ok,
-            'movement_ok': displacement_ok or rotation_ok,
+            'rotation_arc_ok': rotation_ok,
+            'rotation_angle_ok': rotation_angle_ok,
+            'movement_ok': displacement_ok or rotation_ok or rotation_angle_ok,
             'force_ok': force_ok,
             'reason': reason,
         }
@@ -1945,23 +2051,47 @@ class PushEnv(SuccessSeparationMixin):
 
             # 1. 非法碰撞：最高普通失败优先级；与空推/出界绝不叠加。
             illegal_info = self.illegal_contact_envs.get(env_idx)
-            if illegal_info and illegal_info.get('illegal', False):
+            geometry_result = self.action_contact_results.get(env_idx, {})
+            geometry_invalid = geometry_result.get('status') == 'invalid_geometry'
+            if (illegal_info and illegal_info.get('illegal', False)) or geometry_invalid:
                 reward += -10.0
                 reward_breakdown['非法接触'] = -10.0
                 info.update({
                     'failed': True,
+                    # Geometry with no legal window is treated as the same
+                    # terminal failure class for downstream training/logging;
+                    # geometry_invalid preserves the more precise cause.
                     'illegal_contact': True,
-                    'illegal_first_hit': illegal_info.get('first_hit', 'unknown'),
-                    'intended_model_id': illegal_info.get('intended_model_id'),
-                    'intended_prim_path': illegal_info.get('intended_prim_path'),
-                    'illegal_hit_model_id': illegal_info.get('hit_model_id'),
-                    'illegal_hit_prim_path': illegal_info.get('hit_prim_path'),
-                    'illegal_finger_prim_path': illegal_info.get('finger_prim_path'),
-                    'illegal_actor0': illegal_info.get('actor0'),
-                    'illegal_actor1': illegal_info.get('actor1'),
-                    'illegal_collider0': illegal_info.get('collider0'),
-                    'illegal_collider1': illegal_info.get('collider1'),
-                    'illegal_contact_force': illegal_info.get('force', 0.0),
+                    'geometry_invalid': bool(geometry_invalid),
+                    'illegal_first_hit': (
+                        illegal_info.get('first_hit', 'unknown')
+                        if illegal_info else 'no_valid_push_window'
+                    ),
+                    'geometry_invalid_reason': geometry_result.get(
+                        'geometry_invalid_reason'
+                    ),
+                    'intended_model_id': (
+                        illegal_info.get('intended_model_id')
+                        if illegal_info else geometry_result.get('intended_model_id')
+                    ),
+                    'intended_prim_path': (
+                        illegal_info.get('intended_prim_path')
+                        if illegal_info else geometry_result.get('intended_prim_path')
+                    ),
+                    'illegal_hit_model_id': (
+                        illegal_info.get('hit_model_id') if illegal_info else None
+                    ),
+                    'illegal_hit_prim_path': (
+                        illegal_info.get('hit_prim_path') if illegal_info else None
+                    ),
+                    'illegal_finger_prim_path': (
+                        illegal_info.get('finger_prim_path') if illegal_info else None
+                    ),
+                    'illegal_actor0': illegal_info.get('actor0') if illegal_info else None,
+                    'illegal_actor1': illegal_info.get('actor1') if illegal_info else None,
+                    'illegal_collider0': illegal_info.get('collider0') if illegal_info else None,
+                    'illegal_collider1': illegal_info.get('collider1') if illegal_info else None,
+                    'illegal_contact_force': illegal_info.get('force', 0.0) if illegal_info else 0.0,
                 })
                 info['reward_breakdown'] = reward_breakdown
                 info['total_reward'] = reward
@@ -1976,12 +2106,18 @@ class PushEnv(SuccessSeparationMixin):
             info['empty_push'] = is_empty
             info['empty_metrics'] = empty_metrics
             if is_empty:
-                # [旧空推惩罚，已停用]
-                # empty_penalty = -5.0
                 empty_penalty = -10.0
                 reward += empty_penalty
                 reward_breakdown['空推惩罚'] = empty_penalty
-                info['failed'] = True
+                empty_measurement = self.action_push_measurements.get(env_idx, {})
+                if not empty_measurement.get('predeclared_empty', False):
+                    exhausted = self._update_invalid_action_state(
+                        env_idx, actions[env_idx], 'empty'
+                    )
+                else:
+                    exhausted = bool(self.ias_exhausted[env_idx])
+                info['failed'] = bool(exhausted)
+                info['ias_exhausted'] = bool(exhausted)
                 info['reward_breakdown'] = reward_breakdown
                 info['total_reward'] = reward
                 rewards[env_idx] = reward

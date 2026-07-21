@@ -59,6 +59,10 @@ def parse_args():
         help='有效推动所需的目标物体旋转边缘位移 S=theta*D 阈值（米，严格大于）'
     )
     parser.add_argument(
+        '--empty_push_rotation_angle_threshold', default=0.2, type=float,
+        help='有效推动所需的目标物体绕质心旋转角度阈值（rad，严格大于）'
+    )
+    parser.add_argument(
         '--explosion_linear_speed_threshold', default=1.0, type=float,
         help='动力学崩飞的物体三维总线速度阈值（m/s，严格大于）'
     )
@@ -228,8 +232,6 @@ def run_episode(env, agent, force_task_config, epsilon, max_steps, fast_weights=
     states, spawned_objects = env.reset(force_task_config=force_task_config)
 
     transitions = []
-    invalid_actions_list = [[] for _ in range(env.num_envs)]
-
     for step in range(max_steps):
         # 动作前崩飞检测
         exploded = False
@@ -249,7 +251,7 @@ def run_episode(env, agent, force_task_config, epsilon, max_steps, fast_weights=
             state = states[env_idx:env_idx+1]
             action, strategy = agent.select_action(
                 state, epsilon,
-                invalid_actions=invalid_actions_list[env_idx],
+                invalid_actions=env.get_invalid_actions(env_idx),
                 fast_weights=fast_weights
             )
             actions.append(action)
@@ -260,8 +262,9 @@ def run_episode(env, agent, force_task_config, epsilon, max_steps, fast_weights=
         # 打印动作选择信息
         for env_idx in range(env.num_envs):
             masked_str = ""
-            if invalid_actions_list[env_idx]:
-                masked_str = f", 屏蔽={[ACTION_NAMES[a] for a in invalid_actions_list[env_idx]]}"
+            current_invalid = env.get_invalid_actions(env_idx)
+            if current_invalid:
+                masked_str = f", 屏蔽={[ACTION_NAMES[a] for a in current_invalid]}"
             print(f"      Step {step+1} Env{env_idx}: "
                   f"动作={ACTION_NAMES[actions[env_idx]]} ({strategy_types[env_idx]})"
                   f"{masked_str}")
@@ -300,16 +303,7 @@ def run_episode(env, agent, force_task_config, epsilon, max_steps, fast_weights=
             breakdown = f" ({', '.join(parts)})" if parts else ""
             print(f"        → 奖励={reward_val:+.2f}{breakdown}{success_str}{empty_str}{done_str}")
 
-        # 存储 transitions 并更新无效动作列表
         for env_idx in range(env.num_envs):
-            if dones[env_idx]:
-                invalid_actions_list[env_idx] = []
-            elif infos[env_idx].get('empty_push', False):
-                if actions[env_idx] not in invalid_actions_list[env_idx]:
-                    invalid_actions_list[env_idx].append(actions[env_idx])
-            else:
-                invalid_actions_list[env_idx] = []
-
             state_cpu = states[env_idx].cpu()
             next_state_cpu = next_states[env_idx].cpu()
             if state_cpu.dtype != torch.uint8:
@@ -654,8 +648,6 @@ def run_dqn_training(args):
     csv_writer.writerow(['episode', 'step', 'loss', 'reward'])
     print(f"[数据记录] 训练日志将保存到: {csv_path}")
 
-    invalid_actions_list = [[] for _ in range(args.num_envs)]
-
     for episode in range(args.n_episodes):
         episode_retry_count = 0
         max_episode_retries = 5
@@ -712,7 +704,7 @@ def run_dqn_training(args):
                     state = states[env_idx:env_idx+1]
                     action, strategy_type = agent.select_action(
                         state, epsilon,
-                        invalid_actions=invalid_actions_list[env_idx],
+                        invalid_actions=env.get_invalid_actions(env_idx),
                         env_idx=env_idx,
                         debug=debug_print
                     )
@@ -765,14 +757,6 @@ def run_dqn_training(args):
                         print(f"  [跳过崩飞经验] Env {env_idx}: {infos[env_idx].get('out_reason', 'unknown')}")
                         continue
 
-                    if dones[env_idx]:
-                        invalid_actions_list[env_idx] = []
-                    elif infos[env_idx].get('empty_push', False):
-                        if actions[env_idx] not in invalid_actions_list[env_idx]:
-                            invalid_actions_list[env_idx].append(actions[env_idx])
-                    else:
-                        invalid_actions_list[env_idx] = []
-
                     state_cpu = states[env_idx].cpu()
                     next_state_cpu = next_states[env_idx].cpu()
                     if state_cpu.dtype != torch.uint8:
@@ -816,7 +800,9 @@ def run_dqn_training(args):
                     min_buffer_size=args.min_buffer_size,
                     rewards=rewards,
                     actions=actions,
-                    invalid_actions_list=invalid_actions_list,
+                    invalid_actions_list=[
+                        env.get_invalid_actions(i) for i in range(env.num_envs)
+                    ],
                     dones=dones,
                     strategy_types=strategy_types
                 )

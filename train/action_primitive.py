@@ -7,24 +7,27 @@ import torch
 from pathlib import Path
 
 
-PPM = 320.0 / 1.0  # pixels per meter
-CAMERA_Z = 1.25
+PPM = 320.0 / 1.0  # pixels per meter 1像素约为3.125 mm
+CAMERA_Z = 1.25 # 顶视相机在世界坐标中的高度
+TABLE_Z = 0.02 # 桌面在世界坐标中的高度
 
-# 夹爪在图像平面内的近似足迹尺寸。沿推动方向的尺寸较短，横向尺寸较长。
-# 这些尺寸同时用于“候选窗口是否覆盖意图物体/躲避物体”的硬约束。
-GRIPPER_LATERAL_M = 0.03
-GRIPPER_PUSH_AXIS_M = 0.02
+# 夹爪最低端物理足迹
+GRIPPER_LATERAL_M = 0.03 #夹爪尖端检测窗口长度
+GRIPPER_PUSH_AXIS_M = 0.02 #夹爪尖端检测窗口宽度
 
-# sim-ur10 在 452 px/m 图像中以 15 px 作为线段断开阈值。
-# 使用米制常量保存同一物理含义，后续可直接在此处调整。
-EDGE_SEGMENT_GAP_M = 9.0 / 452.0
+# G02 / 高度可行区间参数。
+APPROACH_BAND_M = 0.050 #G00向动作反方向延伸的长度
+TARGET_HEIGHT_STRIP_MIN_M = 0.005 # 从迎推边缘向意图物体内部采样高度，接触条的最近距离
+TARGET_HEIGHT_STRIP_MAX_M = 0.010 # 从迎推边缘向意图物体内部采样高度，接触条的最远距离
+VERTICAL_CLEARANCE_M = 0.010 # G02像素高度筛选时，环境像素+1cm
+MIN_PUSH_OVERLAP_M = 0.010 # G02像素通过筛选时，要求夹爪与意图物体至少在z轴方向上保持1cm重叠
+TARGET_HEIGHT_PERCENTILE = 95.0 # 接触条带内目标高度取95%
+FINAL_PUSH_RETREAT_M = 0.003 # 确定窗口的xy坐标后，向-d平移的距离
+CHANNEL_Z_CLEARANCE_M = 0.01 # 在检测窗口前进通道最高高度上增加的安全余量
 
-# 迁移后的边缘防撞邻域半径。当前推点图像覆盖 1 m / 320 px，30 mm
-# 对应 9.6 px；运行时向上取整为 10 px，保证实际检查范围不小于 30 mm。
-EDGE_NEIGHBOR_RADIUS_M = 0.030
-EDGE_INWARD_SAMPLE_M = 0.009
-EDGE_HEIGHT_OFFSET_M = 0.015
-EDGE_HEIGHT_FLOOR_M = 0.035
+# 动作 4--7 的两档意图障碍物搜索半径。
+OBSTACLE_RAY_TIER1_M = 0.020
+OBSTACLE_RAY_TIER2_M = 0.050
 
 def _ensure_uint8_mask(mask):
     """Normalize binary-like masks to uint8 [0, 255]."""
@@ -134,309 +137,388 @@ def _extract_rear_edge_for_direction(object_mask, push_angle_deg):
     if not points:
         return edge, []
 
-    max_gap_px = max(1, int(np.ceil(0.022 * PPM)))
-    bridge_gap_px = max(1, int(np.ceil(0.009 * PPM)))
-    for idx, (u, v) in enumerate(points):
+    # 不跨列/跨行补线。分割中的凹口、遮挡和断裂均保持原样，避免把不存在
+    # 的迎推表面补成可接触边缘。
+    for u, v in points:
         edge[v, u] = 255
-        if idx == 0:
-            continue
-        pu, pv = points[idx - 1]
-        du = abs(u - pu)
-        dv = abs(v - pv)
-        dist = float(np.hypot(du, dv))
-        slope = float(np.degrees(np.arctan2(dv, du))) if du > 0 else 90.0
-        if (dist <= max_gap_px and slope < 75.0) or dist <= bridge_gap_px:
-            cv2.line(edge, (pu, pv), (u, v), 255, 1)
 
     ys, xs = np.where(edge > 0)
     return edge, list(zip(xs.tolist(), ys.tolist()))
 
 
-def _filter_edge_by_height_30mm(edge_mask, edge_points, global_mask,
-                                object_mask, depth_map):
-    """按 30 mm 邻域和相对高度过滤边缘点。
-
-    与源项目一致：其他物体深度小于等于意图物体局部边缘深度时，
-    认为其物理高度等于或高于边缘，删除对应边缘点。所有剩余片段均保留，
-    由后续横向投影聚类和线段中心选择统一处理。
-    """
-    edge_mask = _ensure_uint8_mask(edge_mask)
-    object_mask = _ensure_uint8_mask(object_mask)
-    global_mask = _ensure_uint8_mask(global_mask)
-    depth = np.asarray(depth_map, dtype=np.float32)
-    if edge_mask is None or object_mask is None:
-        return edge_mask, [], np.zeros_like(depth, dtype=bool), np.zeros_like(depth, dtype=bool)
-
-    radius_px = max(1, int(np.ceil(EDGE_NEIGHBOR_RADIUS_M * PPM)))
-    neighborhood_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * radius_px + 1, 2 * radius_px + 1)
-    )
-    neighborhood_mask = cv2.dilate(edge_mask, neighborhood_kernel, iterations=1) > 0
-
-    other_mask = np.zeros_like(object_mask, dtype=bool)
-    if global_mask is not None:
-        other_mask = (global_mask > 0) & ~(object_mask > 0)
-
-    other_depth = np.full(depth.shape, 10.0, dtype=np.float32)
-    other_depth[other_mask] = depth[other_mask]
-    highest_other_depth = cv2.erode(other_depth, neighborhood_kernel, iterations=1)
-
-    local_radius_px = max(1, int(np.ceil(EDGE_INWARD_SAMPLE_M * PPM)))
-    local_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * local_radius_px + 1, 2 * local_radius_px + 1)
-    )
-    object_depth = np.full(depth.shape, 10.0, dtype=np.float32)
-    object_depth[object_mask > 0] = depth[object_mask > 0]
-    highest_object_depth = cv2.erode(object_depth, local_kernel, iterations=1)
-
-    filtered = edge_mask.copy()
-    deleted = np.zeros_like(filtered, dtype=np.uint8)
-    kept = []
-    for u, v in edge_points:
-        if highest_other_depth[v, u] <= highest_object_depth[v, u]:
-            filtered[v, u] = 0
-            deleted[v, u] = 255
-        else:
-            kept.append((u, v))
-
-    return filtered, kept, neighborhood_mask, deleted > 0
+def _pixel_radius(meters):
+    return max(1, int(np.floor(float(meters) * PPM + 1e-6)))
 
 
-def _select_sim_ur10_edge_anchor(filtered_edge_mask, object_mask, global_mask,
-                                  center_u, center_v, push_angle_deg):
-    """迁移 sim-ur10 的线段中心锚点，并做 R2F140 足迹可行性检查。
-
-    边缘先按横向投影间距聚类；线段按中心到意图物体质心的距离排序。
-    每条线段只检查其中心锚点，不再沿线滑动。若当前线段过窄、越界或
-    回撤后的 32×15 mm 足迹覆盖其他物体，则继续尝试下一线段。
-    """
-    if filtered_edge_mask is None:
-        return None, {
-            'segment_count': 0,
-            'wide_segment_count': 0,
-            'feasible_segment_count': 0,
-            'selected_segment_index': None,
-            'selected_segment_range': None,
-            'selected_segment_mask': None,
-            'geometry_invalid_reason': 'no_filtered_edge',
-        }
-
-    empty_debug = {
-        'segment_count': 0,
-        'wide_segment_count': 0,
-        'feasible_segment_count': 0,
-        'selected_segment_index': None,
-        'selected_segment_range': None,
-        'selected_segment_mask': np.zeros_like(filtered_edge_mask, dtype=bool),
-    }
-    if not np.any(filtered_edge_mask > 0):
-        empty_debug['geometry_invalid_reason'] = 'no_filtered_edge'
-        return None, empty_debug
-
-    edge_v, edge_u = np.where(filtered_edge_mask > 0)
-    edge_points = np.column_stack((edge_u, edge_v)).astype(np.float32)
-    angle_rad = np.radians(float(push_angle_deg))
-    du, dv = float(np.cos(angle_rad)), float(np.sin(angle_rad))
+def _cardinal_components(push_angle_deg):
+    du, dv = _cardinal_push_step(push_angle_deg)
     tu, tv = -dv, du
+    return float(du), float(dv), float(tu), float(tv)
 
-    projections = edge_points[:, 0] * tu + edge_points[:, 1] * tv
-    center_projection = float(center_u) * tu + float(center_v) * tv
-    sorted_projections = np.sort(projections)
-    gap_threshold_px = float(EDGE_SEGMENT_GAP_M * PPM)
 
-    clusters = []
-    current_cluster = [float(sorted_projections[0])]
-    for idx in range(1, len(sorted_projections)):
-        value = float(sorted_projections[idx])
-        if value - float(sorted_projections[idx - 1]) > gap_threshold_px:
-            clusters.append(current_cluster)
-            current_cluster = [value]
-        else:
-            current_cluster.append(value)
-    clusters.append(current_cluster)
+def _rect_bounds(center_u, center_v, push_angle_deg, depth_shape):
+    """Return the raster footprint for the 3.5 x 2.5 cm low gripper."""
+    h, w = depth_shape
+    du, dv, tu, tv = _cardinal_components(push_angle_deg)
+    half_lateral = _pixel_radius(GRIPPER_LATERAL_M / 2.0)
+    half_push = _pixel_radius(GRIPPER_PUSH_AXIS_M / 2.0)
+    half_u = abs(tu) * half_lateral + abs(du) * half_push
+    half_v = abs(tv) * half_lateral + abs(dv) * half_push
+    u0 = int(np.ceil(float(center_u) - half_u))
+    u1 = int(np.floor(float(center_u) + half_u))
+    v0 = int(np.ceil(float(center_v) - half_v))
+    v1 = int(np.floor(float(center_v) + half_v))
+    inside = u0 >= 0 and v0 >= 0 and u1 < w and v1 < h
+    return (u0, u1, v0, v1), inside
 
-    # sim-ur10 首先选择中心最靠近质心的线段。为适配当前夹爪，这里按
-    # 同一距离排序逐条验证，最近线段不可执行时才尝试下一条。
-    ranked_clusters = []
-    for original_index, cluster in enumerate(clusters):
-        segment_center = 0.5 * (cluster[0] + cluster[-1])
-        ranked_clusters.append((
-            abs(segment_center - center_projection),
-            original_index,
-            cluster,
-            segment_center,
-        ))
-    ranked_clusters.sort(key=lambda item: (item[0], item[1]))
 
-    object_mask = _ensure_uint8_mask(object_mask)
-    global_mask = _ensure_uint8_mask(global_mask)
-    other_mask = np.zeros_like(filtered_edge_mask, dtype=bool)
-    if global_mask is not None:
-        other_mask = (global_mask > 0) & ~(
-            object_mask > 0 if object_mask is not None else False
+def _height_map(depth_map, camera_height=None):
+    """Return median-filtered height and the validity of the original depth."""
+    depth = np.asarray(depth_map, dtype=np.float32)
+    valid_depth = np.isfinite(depth) & (depth > 0.0)
+    camera_z = CAMERA_Z if camera_height is None else float(camera_height)
+    if np.any(valid_depth):
+        replacement = float(np.median(depth[valid_depth]))
+    else:
+        replacement = camera_z
+    filtered_depth = np.where(valid_depth, depth, replacement).astype(np.float32)
+    height = camera_z - filtered_depth
+    if np.any(valid_depth):
+        # 3x3 median suppresses isolated RGB-D speckles without changing the
+        # centimeter-scale geometry of the candidate windows.
+        height = cv2.medianBlur(height.astype(np.float32), 3)
+    return height, valid_depth
+
+
+def _percentile_or_none(values, percentile):
+    values = np.asarray(values, dtype=np.float32)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None
+    return float(np.percentile(values, percentile))
+
+
+def _candidate_contact_strip(height, object_mask, q_u, q_v, push_angle_deg):
+    """Sample a 5--10 mm inward, lateral contact strip."""
+    du, dv, tu, tv = _cardinal_components(push_angle_deg)
+    inward0 = max(1, int(np.ceil(TARGET_HEIGHT_STRIP_MIN_M * PPM)))
+    inward1 = max(inward0, int(np.floor(TARGET_HEIGHT_STRIP_MAX_M * PPM)))
+    lateral = _pixel_radius(GRIPPER_LATERAL_M / 2.0)
+    h, w = object_mask.shape
+    values = []
+    for s in range(inward0, inward1 + 1):
+        for lt in range(-lateral, lateral + 1):
+            u = int(round(q_u + du * s + tu * lt))
+            v = int(round(q_v + dv * s + tv * lt))
+            if 0 <= u < w and 0 <= v < h and object_mask[v, u] > 0:
+                values.append(float(height[v, u]))
+    return _percentile_or_none(values, TARGET_HEIGHT_PERCENTILE)
+
+
+def _build_directional_band(object_mask, edge_points, push_angle_deg):
+    """Build G01/G02 by sweeping only the first-hit迎推 edge toward the gripper."""
+    mask = object_mask > 0
+    g01 = mask.copy()
+    h, w = mask.shape
+    du, dv = _cardinal_push_step(push_angle_deg)
+    max_s = max(1, int(np.ceil(APPROACH_BAND_M * PPM)))
+    for u, v in edge_points:
+        for s in range(1, max_s + 1):
+            su = int(u - du * s)
+            sv = int(v - dv * s)
+            if 0 <= su < w and 0 <= sv < h:
+                g01[sv, su] = True
+    return g01, g01 & ~mask
+
+
+def _build_contact_height_maps(height, object_mask, edge_points,
+                               push_angle_deg, g02):
+    """Associate every G02 pixel with its source edge point and P90 height."""
+    h, w = g02.shape
+    du, dv = _cardinal_push_step(push_angle_deg)
+    max_s = max(1, int(np.ceil(APPROACH_BAND_M * PPM)))
+    target_height = np.full((h, w), np.nan, dtype=np.float32)
+    contact_u = np.full((h, w), -1, dtype=np.int32)
+    contact_v = np.full((h, w), -1, dtype=np.int32)
+    for q_u, q_v in edge_points:
+        q_u = int(q_u)
+        q_v = int(q_v)
+        h_target = _candidate_contact_strip(
+            height, object_mask, q_u, q_v, push_angle_deg
         )
+        for s in range(1, max_s + 1):
+            u = int(q_u - du * s)
+            v = int(q_v - dv * s)
+            if not (0 <= u < w and 0 <= v < h and g02[v, u]):
+                continue
+            contact_u[v, u] = q_u
+            contact_v[v, u] = q_v
+            if h_target is not None:
+                target_height[v, u] = float(h_target)
+    return target_height, contact_u, contact_v
 
-    h, w = filtered_edge_mask.shape
-    min_segment_width_px = float(GRIPPER_LATERAL_M * PPM)
-    half_lateral_px = 0.5 * min_segment_width_px
-    half_push_px = 0.5 * float(GRIPPER_PUSH_AXIS_M * PPM)
-    retreat_px = float(0.005 * PPM)
-    half_u_px = abs(tu) * half_lateral_px + abs(du) * half_push_px
-    half_v_px = abs(tv) * half_lateral_px + abs(dv) * half_push_px
-    wide_segment_count = sum(
-        float(cluster[-1] - cluster[0]) >= min_segment_width_px
-        for cluster in clusters
+
+def _window_kernel(push_angle_deg):
+    """Return the exact axis-aligned C4 footprint used by ``_rect_bounds``."""
+    du, dv, tu, tv = _cardinal_components(push_angle_deg)
+    half_lateral = _pixel_radius(GRIPPER_LATERAL_M / 2.0)
+    half_push = _pixel_radius(GRIPPER_PUSH_AXIS_M / 2.0)
+    half_u = int(abs(tu) * half_lateral + abs(du) * half_push)
+    half_v = int(abs(tv) * half_lateral + abs(dv) * half_push)
+    return np.ones((2 * half_v + 1, 2 * half_u + 1), dtype=np.uint8)
+
+
+def _build_push_channel_mask(start_u, start_v, contact_u, contact_v,
+                             push_angle_deg, image_shape):
+    """Sweep the gripper window from the final XY until first edge contact."""
+    du, dv, _, _ = _cardinal_components(push_angle_deg)
+    half_push = _pixel_radius(GRIPPER_PUSH_AXIS_M / 2.0)
+    end_u = float(contact_u) - du * half_push
+    end_v = float(contact_v) - dv * half_push
+    distance_px = max(
+        0.0,
+        (end_u - float(start_u)) * du + (end_v - float(start_v)) * dv,
     )
-    feasible_segment_count = 0
-
-    for _, original_index, cluster, segment_center in ranked_clusters:
-        segment_width_px = float(cluster[-1] - cluster[0])
-        if segment_width_px < min_segment_width_px:
-            continue
-
-        # 将线段中心吸附到最近的真实横向投影，再取对应的实际边缘像素。
-        target_projection = projections[np.argmin(np.abs(projections - segment_center))]
-        contact_index = int(np.argmin(np.abs(projections - target_projection)))
-        contact_u, contact_v = edge_points[contact_index]
-        push_u = float(contact_u - du * retreat_px)
-        push_v = float(contact_v - dv * retreat_px)
-
-        if (
-            push_u - half_u_px < 0.0
-            or push_u + half_u_px > w - 1
-            or push_v - half_v_px < 0.0
-            or push_v + half_v_px > h - 1
-        ):
-            continue
-
-        # 当前仅支持 C4，足迹在图像中始终轴对齐。使用像素中心判断
-        # 32×15 mm 矩形内是否存在任何非意图物体。
-        u_min = max(0, int(np.ceil(push_u - half_u_px)))
-        u_max = min(w - 1, int(np.floor(push_u + half_u_px)))
-        v_min = max(0, int(np.ceil(push_v - half_v_px)))
-        v_max = min(h - 1, int(np.floor(push_v + half_v_px)))
-        if np.any(other_mask[v_min:v_max + 1, u_min:u_max + 1]):
-            continue
-
-        feasible_segment_count += 1
-        selected_segment_mask = (
-            (projections >= float(cluster[0]))
-            & (projections <= float(cluster[-1]))
+    channel_mask = np.zeros(image_shape, dtype=bool)
+    sample_count = max(1, int(np.ceil(distance_px)))
+    for step in range(sample_count + 1):
+        travel = min(float(step), distance_px)
+        center_u = float(start_u) + du * travel
+        center_v = float(start_v) + dv * travel
+        bounds, inside = _rect_bounds(
+            center_u, center_v, push_angle_deg, image_shape
         )
-        selected_mask_image = np.zeros_like(filtered_edge_mask, dtype=bool)
-        selected_points = edge_points[selected_segment_mask].astype(np.int32)
-        selected_mask_image[selected_points[:, 1], selected_points[:, 0]] = True
-        return {
-            'contact_pixel': (int(round(contact_u)), int(round(contact_v))),
-            'push_pixel_float': (push_u, push_v),
-        }, {
-            'segment_count': int(len(clusters)),
-            'wide_segment_count': int(wide_segment_count),
-            'feasible_segment_count': int(feasible_segment_count),
-            'selected_segment_index': int(original_index),
-            'selected_segment_range': (
-                float(cluster[0]), float(cluster[-1])
-            ),
-            'selected_segment_mask': selected_mask_image,
-            'segment_gap_threshold_px': gap_threshold_px,
-        }
-
-    reason = (
-        'no_segment_wide_enough'
-        if wide_segment_count == 0
-        else 'no_collision_free_gripper_window'
-    )
-    empty_debug.update({
-        'segment_count': int(len(clusters)),
-        'wide_segment_count': int(wide_segment_count),
-        'feasible_segment_count': int(feasible_segment_count),
-        'segment_gap_threshold_px': gap_threshold_px,
-        'geometry_invalid_reason': reason,
-    })
-    return None, empty_debug
+        if not inside:
+            return channel_mask, False, (end_u, end_v)
+        u0, u1, v0, v1 = bounds
+        channel_mask[v0:v1 + 1, u0:u1 + 1] = True
+    return channel_mask, True, (end_u, end_v)
 
 
 def _compute_migrated_edge_push(depth_map, object_mask, center_u, center_v,
                                 push_angle_deg, global_mask=None,
-                                debug_info=None):
-    """执行迁移后的边缘过滤、线段锚点和最高边缘高度推点算法。"""
+                                debug_info=None, table_height=None,
+                                camera_height=None):
+    """Filter G02 per pixel, slide the gripper window, and select a push."""
     depth = np.asarray(depth_map, dtype=np.float32)
-    depth = np.nan_to_num(depth, nan=CAMERA_Z, posinf=CAMERA_Z, neginf=CAMERA_Z)
     object_mask = _ensure_uint8_mask(object_mask)
-    if debug_info is not None:
-        debug_info.clear()
+    if object_mask is None or object_mask.size == 0:
+        if debug_info is not None:
+            debug_info.clear()
+            debug_info['geometry_invalid_reason'] = 'empty_intended_mask'
+        return None
 
     edge_mask, edge_points = _extract_rear_edge_for_direction(object_mask, push_angle_deg)
-    filtered_mask, filtered_points, neighborhood_mask, deleted_mask = _filter_edge_by_height_30mm(
-        edge_mask, edge_points, global_mask, object_mask, depth
-    )
-    result, selection_debug = _select_sim_ur10_edge_anchor(
-        filtered_mask,
-        object_mask,
-        global_mask,
-        center_u,
-        center_v,
-        push_angle_deg,
-    )
+    g01, g02 = _build_directional_band(object_mask, edge_points, push_angle_deg)
+    height, valid_depth = _height_map(depth, camera_height=camera_height)
+    table_z = TABLE_Z if table_height is None else float(table_height)
 
     if debug_info is not None:
+        debug_info.clear()
         debug_info.update({
             'raw_edge_mask': edge_mask > 0,
-            'candidate_mask': filtered_mask > 0,
-            'edge_neighborhood_mask': neighborhood_mask,
-            'height_deleted_mask': deleted_mask,
-            'selected_from_candidates': result is not None,
+            'candidate_mask': np.zeros_like(g02, dtype=bool),
+            'g00_mask': object_mask > 0,
+            'g01_mask': g01,
+            'g02_mask': g02,
+            'edge_neighborhood_mask': g02,
+            'raw_obs_mask': np.zeros_like(g02, dtype=bool),
+            'obs_mask': np.zeros_like(g02, dtype=bool),
+            'height_feasible_mask': np.zeros_like(g02, dtype=bool),
+            'window_center_mask': np.zeros_like(g02, dtype=bool),
+            'selected_window_mask': np.zeros_like(g02, dtype=bool),
+            'channel_mask': np.zeros_like(g02, dtype=bool),
+            'selected_from_candidates': False,
+            'edge_points': edge_points,
         })
-        debug_info.update(selection_debug)
 
-    if result is None:
+    if not edge_points:
         if debug_info is not None:
-            debug_info['geometry_invalid_reason'] = selection_debug.get(
-                'geometry_invalid_reason', 'no_valid_edge_segment'
-            )
+            debug_info['geometry_invalid_reason'] = 'no_filtered_edge'
         return None
 
-    # 高度采样使用全部高度过滤后边缘，并沿推动方向向物体内部偏移约 9 mm。
-    inward_px = max(1, int(np.ceil(EDGE_INWARD_SAMPLE_M * PPM)))
-    du, dv = _cardinal_push_step(push_angle_deg)
-    edge_depths = []
-    for u, v in filtered_points:
-        sample_u = int(np.clip(u + du * inward_px, 0, depth.shape[1] - 1))
-        sample_v = int(np.clip(v + dv * inward_px, 0, depth.shape[0] - 1))
-        value = float(depth[sample_v, sample_u])
-        if np.isfinite(value) and 0.0 < value < 1.9:
-            edge_depths.append(value)
+    du, dv, tu, tv = _cardinal_components(push_angle_deg)
+    centroid_u, centroid_v = _compute_mask_center(object_mask)
+    center_t = float(centroid_u) * tu + float(centroid_v) * tv
 
-    if not edge_depths:
-        if debug_info is not None:
-            debug_info['geometry_invalid_reason'] = 'no_valid_edge_depth'
-        return None
-
-    # 深度越小代表物理高度越高。与 sim-ur10 一致，使用全部绿色过滤
-    # 边缘中的最高高度，而不是均值或仅选中线段的高度。
-    max_edge_height = CAMERA_Z - float(np.min(edge_depths))
-    push_z = max(max_edge_height - EDGE_HEIGHT_OFFSET_M, EDGE_HEIGHT_FLOOR_M)
-    push_u, push_v = result['push_pixel_float']
-    contact_u, contact_v = result['contact_pixel']
-    selected_depth = float(depth[contact_v, contact_u])
+    target_height_map, contact_u_map, contact_v_map = _build_contact_height_maps(
+        height, object_mask, edge_points, push_angle_deg, g02
+    )
+    environment_height = np.maximum(height, table_z)
+    pixel_z_min = environment_height + VERTICAL_CLEARANCE_M
+    pixel_z_max = target_height_map - MIN_PUSH_OVERLAP_M
+    raw_obs_mask = g02 & (
+        ~valid_depth
+        | ~np.isfinite(target_height_map)
+        | (pixel_z_min > pixel_z_max)
+    )
+    obs_mask = cv2.dilate(
+        raw_obs_mask.astype(np.uint8),
+        np.ones((3, 3), dtype=np.uint8),
+        iterations=1,
+    ) > 0
+    obs_mask &= g02
+    height_feasible = g02 & ~obs_mask
 
     if debug_info is not None:
         debug_info.update({
-            'selected_contact_pixel': result['contact_pixel'],
-            'push_pixel_float': (push_u, push_v),
-            'edge_max_height': float(max_edge_height),
-            'edge_height_sample_count': int(len(edge_depths)),
-            'push_z': float(push_z),
+            'raw_obs_mask': raw_obs_mask,
+            'obs_mask': obs_mask,
+            'height_feasible_mask': height_feasible,
+            'target_height_map_p90': target_height_map,
         })
-    return push_u, push_v, push_z, selected_depth
+
+    if not np.any(height_feasible):
+        if debug_info is not None:
+            debug_info['geometry_invalid_reason'] = 'no_height_feasible_pixels'
+        return None
+
+    kernel = _window_kernel(push_angle_deg)
+    window_fit_mask = cv2.erode(
+        height_feasible.astype(np.uint8), kernel,
+        borderType=cv2.BORDER_CONSTANT, borderValue=0,
+    ) > 0
+    window_fit_mask &= height_feasible
+    if debug_info is not None:
+        debug_info['window_center_mask'] = window_fit_mask.copy()
+
+    if not np.any(window_fit_mask):
+        if debug_info is not None:
+            debug_info['geometry_invalid_reason'] = 'no_window_fit_after_height_filter'
+        return None
+
+    candidates = []
+    center_vs, center_us = np.where(window_fit_mask)
+    for p_v, p_u in zip(center_vs.tolist(), center_us.tolist()):
+        q_u = int(contact_u_map[p_v, p_u])
+        q_v = int(contact_v_map[p_v, p_u])
+        h_target = float(target_height_map[p_v, p_u])
+        if q_u < 0 or q_v < 0 or not np.isfinite(h_target):
+            continue
+        bounds, inside = _rect_bounds(p_u, p_v, push_angle_deg, depth.shape)
+        if not inside:
+            continue
+        line_error = abs((float(q_u) * tu + float(q_v) * tv) - center_t)
+        standoff = (float(q_u - p_u) * du + float(q_v - p_v) * dv)
+        candidates.append({
+            'push_u': float(p_u),
+            'push_v': float(p_v),
+            'contact_u': q_u,
+            'contact_v': q_v,
+            'h_target_p90': float(h_target),
+            'line_error_px': float(line_error),
+            'standoff_px': float(standoff),
+            'window_bounds': bounds,
+        })
+
+    if not candidates:
+        if debug_info is not None:
+            debug_info['geometry_invalid_reason'] = 'no_window_fit_after_height_filter'
+        return None
+
+    candidate_mask = np.zeros_like(g02, dtype=bool)
+    for item in candidates:
+        candidate_mask[int(item['push_v']), int(item['push_u'])] = True
+    clearance = cv2.distanceTransform(candidate_mask.astype(np.uint8), cv2.DIST_L2, 3)
+    for item in candidates:
+        u = int(item['push_u'])
+        v = int(item['push_v'])
+        item['clearance_px'] = float(clearance[v, u])
+    candidates.sort(key=lambda item: (
+        item['line_error_px'],
+        -item['clearance_px'],
+        abs(item['standoff_px'] - 0.02 * PPM),
+        int(round(item['push_v'])),
+        int(round(item['push_u'])),
+    ))
+    selected = candidates[0]
+    u0, u1, v0, v1 = selected['window_bounds']
+    selected_center_u = selected['push_u']
+    selected_center_v = selected['push_v']
+    retreat_px = FINAL_PUSH_RETREAT_M * PPM
+    final_push_u = selected_center_u - du * retreat_px
+    final_push_v = selected_center_v - dv * retreat_px
+    channel_mask, channel_inside, channel_end = _build_push_channel_mask(
+        final_push_u,
+        final_push_v,
+        selected['contact_u'],
+        selected['contact_v'],
+        push_angle_deg,
+        depth.shape,
+    )
+    channel_height_mask = channel_mask & ~(object_mask > 0)
+    if not channel_inside or not np.any(channel_height_mask):
+        if debug_info is not None:
+            debug_info.update({
+                'candidate_mask': candidate_mask,
+                'window_center_mask': candidate_mask,
+                'channel_mask': channel_height_mask,
+                'geometry_invalid_reason': 'invalid_push_channel',
+            })
+        return None
+    if not np.all(valid_depth[channel_height_mask]):
+        if debug_info is not None:
+            debug_info.update({
+                'candidate_mask': candidate_mask,
+                'window_center_mask': candidate_mask,
+                'channel_mask': channel_height_mask,
+                'geometry_invalid_reason': 'invalid_channel_depth',
+            })
+        return None
+    channel_max_height = float(np.max(environment_height[channel_height_mask]))
+    z_value = channel_max_height + CHANNEL_Z_CLEARANCE_M
+    if z_value > 0.4:
+        if debug_info is not None:
+            debug_info.update({
+                'candidate_mask': candidate_mask,
+                'window_center_mask': candidate_mask,
+                'channel_mask': channel_height_mask,
+                'channel_max_height': channel_max_height,
+                'geometry_invalid_reason': 'no_feasible_z',
+            })
+        return None
+
+    selected_mask = np.zeros_like(g02, dtype=bool)
+    selected_mask[v0:v1 + 1, u0:u1 + 1] = True
+    if debug_info is not None:
+        debug_info.update({
+            'candidate_mask': candidate_mask,
+            'window_center_mask': candidate_mask,
+            'selected_window_mask': selected_mask,
+            'selected_window_bounds': selected['window_bounds'],
+            'selected_from_candidates': True,
+            'selected_contact_pixel': (
+                int(selected['contact_u']), int(selected['contact_v'])
+            ),
+            'selected_window_center_pixel': (
+                selected_center_u, selected_center_v
+            ),
+            'channel_mask': channel_height_mask,
+            'channel_end_center_pixel': channel_end,
+            'channel_max_height': channel_max_height,
+            'channel_z_clearance_m': CHANNEL_Z_CLEARANCE_M,
+            'final_push_retreat_m': FINAL_PUSH_RETREAT_M,
+            'push_pixel_float': (final_push_u, final_push_v),
+            'push_z': float(z_value),
+            'h_target_p90': selected['h_target_p90'],
+            'line_error_px': selected['line_error_px'],
+            'clearance_px': selected['clearance_px'],
+            'geometry_valid': True,
+        })
+    return (
+        final_push_u, final_push_v,
+        float(z_value), float(depth[int(selected['contact_v']), int(selected['contact_u'])])
+    )
 
 
 
 def _find_dominant_obstacle_mask(seg_map, target_mask, global_mask, center_u, center_v,
                                  direction_idx, target_id, background_id):
-    """
-    Adapt the source-project beam search:
-    launch a 6 cm beam in the push direction and choose the most-hit obstacle id.
+    """Choose the action-4--7 intended obstacle using two first-hit ray tiers.
+
+    Tier 1 searches [0, 20 mm]. Tier 2 is consulted only when tier 1 has no
+    hit and searches (20, 50 mm]. Within a tier, the widest projected obstacle
+    wins; distance only breaks a width tie.
     """
     target_mask = _ensure_uint8_mask(target_mask)
     global_mask = _ensure_uint8_mask(global_mask)
@@ -447,81 +529,87 @@ def _find_dominant_obstacle_mask(seg_map, target_mask, global_mask, center_u, ce
         return None, -1
 
     push_angle_deg = _get_push_angle_deg(direction_idx)
-    angle_rad = np.radians(push_angle_deg)
-    du_push = np.cos(angle_rad)
-    dv_push = np.sin(angle_rad)
-    perp_du = -dv_push
-    perp_dv = du_push
-
-    target_ys, target_xs = np.where(target_mask > 0)
+    du, dv, tu, tv = _cardinal_components(push_angle_deg)
+    target = target_mask > 0
+    h, w = target.shape
+    target_ys, target_xs = np.where(target)
     if target_ys.size == 0:
-        return None, -1
+        return None, -1, {'outcome': 'empty', 'empty_reason': 'empty_target_mask'}
 
-    rel_u = target_xs.astype(float) - center_u
-    rel_v = target_ys.astype(float) - center_v
-    longitudinal = rel_u * du_push + rel_v * dv_push
-    lateral = rel_u * perp_du + rel_v * perp_dv
-
+    # Build the +d front contour: one first-hit target pixel per transverse
+    # coordinate. This is the same contour used by the two ray tiers.
     edge_line = {}
-    for lon_val, lat_val in zip(longitudinal, lateral):
-        lat_key = int(round(lat_val))
-        lon_val = float(lon_val)
-        if lat_key not in edge_line or lon_val > edge_line[lat_key]:
-            edge_line[lat_key] = lon_val
-
+    for u, v in zip(target_xs.tolist(), target_ys.tolist()):
+        lateral = int(round(float(u) * tu + float(v) * tv))
+        longitudinal = float(u) * du + float(v) * dv
+        if lateral not in edge_line or longitudinal > edge_line[lateral][0]:
+            edge_line[lateral] = (longitudinal, int(u), int(v))
     if not edge_line:
-        return None, -1
+        return None, -1, {'outcome': 'empty', 'empty_reason': 'no_target_front_edge'}
 
-    mm_to_px = PPM / 1000.0
-    beam_half_width_px = 30.0 * mm_to_px
-    n_rays = max(3, int(beam_half_width_px * 2) + 1)
-    max_dist = int(np.hypot(*target_mask.shape))
+    tier_stats = []
+    for tier, (min_m, max_m) in enumerate(((0.0, OBSTACLE_RAY_TIER1_M),
+                                            (OBSTACLE_RAY_TIER1_M, OBSTACLE_RAY_TIER2_M)), 1):
+        hits = {}
+        total_rays = len(edge_line)
+        max_step = int(np.floor(max_m * PPM + 1e-6))
+        min_step = max(1, int(np.floor(min_m * PPM + 1e-6)) + 1)
+        for _, (_, edge_u, edge_v) in sorted(edge_line.items()):
+            for step in range(min_step, max_step + 1):
+                ray_u = int(round(edge_u + du * step))
+                ray_v = int(round(edge_v + dv * step))
+                if ray_u < 0 or ray_u >= w or ray_v < 0 or ray_v >= h:
+                    break
+                if target[ray_v, ray_u]:
+                    continue
+                seg_val = int(seg_map[ray_v, ray_u])
+                if (
+                    seg_val != int(background_id)
+                    and seg_val != int(target_id)
+                    and global_mask[ray_v, ray_u] > 0
+                ):
+                    entry = hits.setdefault(seg_val, [])
+                    entry.append(float(step / PPM))
+                    break
+        stat = {
+            'tier': tier,
+            'min_distance_m': float(min_m),
+            'max_distance_m': float(max_m),
+            'ray_count': int(total_rays),
+            'instances': {
+                int(seg_id): {
+                    'hit_count': int(len(distances)),
+                    'coverage': float(len(distances) / max(total_rays, 1)),
+                    'median_distance_m': float(np.median(distances)),
+                    'min_distance_m': float(np.min(distances)),
+                }
+                for seg_id, distances in hits.items()
+            },
+        }
+        tier_stats.append(stat)
+        if hits:
+            dominant_seg_id = min(
+                hits,
+                key=lambda seg_id: (
+                    -len(hits[seg_id]),
+                    float(np.median(hits[seg_id])),
+                    float(np.min(hits[seg_id])),
+                    int(seg_id),
+                ),
+            )
+            dominant_mask = (seg_map == dominant_seg_id).astype(np.uint8) * 255
+            return dominant_mask, int(dominant_seg_id), {
+                'outcome': 'selected',
+                'selected_tier': tier,
+                'selected_seg_id': int(dominant_seg_id),
+                'tier_stats': tier_stats,
+            }
 
-    h, w = target_mask.shape
-    hit_id_counts = {}
-
-    for ri in range(n_rays):
-        offset = -beam_half_width_px + (
-            2.0 * beam_half_width_px * ri / max(n_rays - 1, 1)
-        )
-        lat_key = int(round(offset))
-
-        if lat_key in edge_line:
-            edge_dist = edge_line[lat_key]
-        else:
-            closest_key = min(edge_line.keys(), key=lambda k: abs(k - lat_key))
-            if abs(closest_key - lat_key) > 2:
-                continue
-            edge_dist = edge_line[closest_key]
-
-        start_u = center_u + perp_du * offset
-        start_v = center_v + perp_dv * offset
-        start_step = int(edge_dist) + 1
-
-        for step in range(start_step, max_dist):
-            ray_u = int(round(start_u + du_push * step))
-            ray_v = int(round(start_v + dv_push * step))
-
-            if ray_u < 0 or ray_u >= w or ray_v < 0 or ray_v >= h:
-                break
-            if target_mask[ray_v, ray_u] > 0:
-                continue
-
-            seg_val = int(seg_map[ray_v, ray_u])
-            if (
-                seg_val != background_id
-                and seg_val != target_id
-                and global_mask[ray_v, ray_u] > 0
-            ):
-                hit_id_counts[seg_val] = hit_id_counts.get(seg_val, 0) + 1
-                break
-
-    if not hit_id_counts:
-        return None, -1
-
-    dominant_seg_id = max(hit_id_counts, key=hit_id_counts.get)
-    dominant_mask = (seg_map == dominant_seg_id).astype(np.uint8) * 255
-    return dominant_mask, int(dominant_seg_id)
+    return None, -1, {
+        'outcome': 'empty',
+        'empty_reason': 'no_obstacle_within_5cm',
+        'tier_stats': tier_stats,
+    }
 
 
 def _prim_path_for_seg_id(seg_id, seg_map, state, spawned_objects):
@@ -648,20 +736,26 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
         raise ValueError(f"Env {env_idx}: 目标物体掩膜为空")
 
     center_u, center_v = target_center
-    center_depth = depth_map[center_v, center_u]
 
     # [点1] 记录该动作"第一下应该碰到的物体" seg id, 供 env_wrapper 的接触判定使用。
     #   推目标 (0-3): intended = target_id
     #   推障碍 (4-7): intended = 选中的 dominant 障碍 id (无则 -1)
     geometry_debug = {} if debug_info is not None else None
     geometry_invalid_reason = None
+    outcome = 'push'
+    empty_reason = None
+    obstacle_selection_debug = None
+    table_height = getattr(state, '_external_table_height', None)
+    camera_height = getattr(state, '_external_camera_height', None)
     if action_idx <= 3:
         # ===== 推目标物体 =====
         direction_idx = action_idx
         push_angle_deg = _get_push_angle_deg(direction_idx)
         migrated_result = _compute_migrated_edge_push(
             depth_map, target_mask, center_u, center_v, push_angle_deg,
-            global_mask=global_mask, debug_info=geometry_debug
+            global_mask=global_mask, debug_info=geometry_debug,
+            table_height=table_height,
+            camera_height=camera_height,
         )
         if migrated_result is None:
             push_u = push_v = push_z = None
@@ -677,7 +771,7 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
         direction_idx = action_idx - 4
         push_angle_deg = _get_push_angle_deg(direction_idx)
 
-        dominant_obstacle_mask, dominant_seg_id = _find_dominant_obstacle_mask(
+        dominant_obstacle_mask, dominant_seg_id, obstacle_selection_debug = _find_dominant_obstacle_mask(
             seg_map=seg_map,
             target_mask=target_mask,
             global_mask=global_mask,
@@ -688,7 +782,24 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
             background_id=background_id,
         )
 
-        if dominant_seg_id != -1:
+        if obstacle_selection_debug.get('outcome') == 'empty':
+            outcome = 'empty'
+            empty_reason = obstacle_selection_debug.get(
+                'empty_reason', 'no_obstacle_within_5cm'
+            )
+            push_u = push_v = push_z = None
+            intended_seg_id = -1
+            intended_mask = np.zeros_like(target_mask, dtype=np.uint8)
+            if geometry_debug is not None:
+                geometry_debug.clear()
+                geometry_debug.update({
+                    'candidate_mask': np.zeros_like(target_mask, dtype=bool),
+                    'edge_neighborhood_mask': np.zeros_like(target_mask, dtype=bool),
+                    'selected_from_candidates': False,
+                    'obstacle_selection': obstacle_selection_debug,
+                    'geometry_valid': False,
+                })
+        elif dominant_seg_id != -1:
             obstacle_center = _compute_mask_center(dominant_obstacle_mask)
             if obstacle_center is not None:
                 obstacle_u, obstacle_v = obstacle_center
@@ -701,6 +812,8 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
                     push_angle_deg,
                     global_mask=global_mask,
                     debug_info=geometry_debug,
+                    table_height=table_height,
+                    camera_height=camera_height,
                 )
                 if migrated_result is None:
                     push_u = push_v = push_z = None
@@ -731,15 +844,20 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
                     'selected_from_candidates': False,
                     'geometry_invalid_reason': geometry_invalid_reason,
                 })
-        intended_seg_id = int(dominant_seg_id)  # -1 表示未选到障碍，动作几何无效
+        if outcome != 'empty':
+            intended_seg_id = int(dominant_seg_id)  # -1 表示未选到障碍
         intended_mask = (
             dominant_obstacle_mask
             if dominant_obstacle_mask is not None
             else np.zeros_like(target_mask, dtype=np.uint8)
-        )
+        ) if outcome != 'empty' else intended_mask
 
     # 没有安全几何推点时不产生任何默认运动点，由环境按空推处理。
     geometry_valid = push_u is not None and push_v is not None and push_z is not None
+    if outcome == 'empty':
+        geometry_valid = False
+    elif not geometry_valid:
+        outcome = 'invalid_geometry'
 
     # 转换为世界坐标
     # [Fix] 坐标系修复：根据State.world_to_pixel的定义
@@ -762,7 +880,10 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
 
     push_point = None
     if geometry_valid:
-        push_point = torch.tensor([push_x, push_y, push_z], dtype=torch.float32, device='cuda')
+        device = getattr(state, 'device', None)
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        push_point = torch.tensor([push_x, push_y, push_z], dtype=torch.float32, device=device)
 
     # [点1] 接触判定所需信息: 该动作"意图碰到的物体" prim_path + 动作类型。
     #   env_wrapper 用 PhysX 成对接触列拿到“第一下实际碰到的刚体 prim_path”，与此比对。
@@ -785,6 +906,10 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
         'intended_prim_path': intended_prim_path,
         'intended_model_id': _model_id_for_prim_path(intended_prim_path, spawned_objects),
         'kind': 'target' if action_idx <= 3 else 'obstacle',
+        'outcome': outcome,
+        'empty_push': outcome == 'empty',
+        'empty_reason': empty_reason,
+        'obstacle_selection': obstacle_selection_debug,
         'geometry_valid': bool(geometry_valid),
         'geometry_invalid_reason': geometry_invalid_reason,
     }
@@ -808,6 +933,9 @@ def compute_push_point_from_action(action_idx, env_idx, state, scene, spawned_ob
             'intended_seg_id': int(intended_seg_id),
             'geometry_valid': bool(geometry_valid),
             'geometry_invalid_reason': geometry_invalid_reason,
+            'outcome': outcome,
+            'empty_reason': empty_reason,
+            'obstacle_selection': obstacle_selection_debug,
         })
 
     return push_point, direction_idx, contact_spec

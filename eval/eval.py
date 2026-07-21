@@ -72,6 +72,8 @@ def parse_args():
                         help='有效推动所需的任一夹爪手指峰值接触力阈值（N，严格大于）')
     parser.add_argument('--empty_push_rotation_arc_threshold', default=0.01, type=float,
                         help='有效推动所需的目标物体旋转边缘位移 S=theta*D 阈值（米，严格大于）')
+    parser.add_argument('--empty_push_rotation_angle_threshold', default=0.2, type=float,
+                        help='有效推动所需的目标物体绕质心旋转角度阈值（rad，严格大于）')
     parser.add_argument('--explosion_linear_speed_threshold', default=1.0, type=float,
                         help='动力学崩飞的物体三维总线速度阈值（m/s，严格大于）')
     parser.add_argument('--explosion_linear_acceleration_threshold', default=50.0, type=float,
@@ -274,8 +276,6 @@ def run_evaluation_batch(args, seed, env, agent, batch_idx=0, total_batches=1):
             episode_empty_push_count = 0
             episode_steps = 0
             episode_fail_reason = ""
-            invalid_actions = [[] for _ in range(args.num_envs)]
-
             for step in range(args.episode_max_steps):
                 # ---- 动作前崩飞检测 ----
                 pre_exploded = False
@@ -303,7 +303,7 @@ def run_evaluation_batch(args, seed, env, agent, batch_idx=0, total_batches=1):
                     state = states[env_idx:env_idx + 1]
                     action, _ = agent.select_action(
                         state, epsilon=0.0,
-                        invalid_actions=invalid_actions[env_idx],
+                        invalid_actions=env.get_invalid_actions(env_idx),
                         env_idx=env_idx
                     )
                     actions.append(action)
@@ -356,21 +356,14 @@ def run_evaluation_batch(args, seed, env, agent, batch_idx=0, total_batches=1):
                     print(f"\n  Step {step + 1}/{args.episode_max_steps}")
                     print_step_log(
                         step + 1, args.episode_max_steps,
-                        actions[env_idx], invalid_actions[env_idx], info,
+                        actions[env_idx], env.get_invalid_actions(env_idx), info,
                         is_exploded_step=info.get('is_exploded', False)
                     )
 
                     if info.get('empty_push', False):
                         episode_empty_push_count += 1
 
-                    # 更新无效动作列表 (IAS)。空推现为终止失败，不带到下一 episode。
-                    if dones[env_idx]:
-                        invalid_actions[env_idx] = []
-                    elif info.get('empty_push', False):
-                        if actions[env_idx] not in invalid_actions[env_idx]:
-                            invalid_actions[env_idx].append(actions[env_idx])
-                    else:
-                        invalid_actions[env_idx] = []
+                    # IAS 由 PushEnv 维护，避免不同评估入口状态分叉。
 
                     # 记录结果标记
                     if (not step_exploded) and info.get('success', False):

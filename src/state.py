@@ -36,6 +36,13 @@ class State:
         # 普通诊断/成功判定中的 get_img() 不会覆盖它。
         self._cached_observation_images = None
         self._cached_observation_masks = None
+        # Real-camera adapters may provide task-selected instance masks directly.
+        # The push geometry consumes these arrays and never depends on simulator
+        # label metadata. They are cleared only when explicitly replaced/cleared.
+        self._external_target_mask = None
+        self._external_instance_map = None
+        self._external_table_height = None
+        self._external_camera_height = None
         
     # @property
     # def sam(self):
@@ -57,6 +64,30 @@ class State:
         self.camera.reset()
         self._cached_observation_images = None
         self._cached_observation_masks = None
+
+    def set_external_observation_masks(
+        self, target_mask, instance_map=None, table_height=None,
+        camera_height=None
+    ):
+        """Install real-world/task-provided masks for subsequent observations."""
+        self._external_target_mask = (
+            None if target_mask is None else np.asarray(target_mask).copy()
+        )
+        self._external_instance_map = (
+            None if instance_map is None else np.asarray(instance_map).copy()
+        )
+        self._external_table_height = (
+            None if table_height is None else float(table_height)
+        )
+        self._external_camera_height = (
+            None if camera_height is None else float(camera_height)
+        )
+
+    def clear_external_observation_masks(self):
+        self._external_target_mask = None
+        self._external_instance_map = None
+        self._external_table_height = None
+        self._external_camera_height = None
     
     def get_state(self, spawned_objects):
         """
@@ -92,6 +123,15 @@ class State:
             self._cached_observation_masks = None
             print("⚠ 警告: 无法获取图像数据")
             return None
+
+        if (
+            self._external_instance_map is not None
+            and self._external_instance_map.shape == seg.shape
+        ):
+            # Keep the instance map used by geometry in the same cached frame
+            # as RGB/depth; real-camera adapters need not expose simulator IDs.
+            seg = self._external_instance_map.copy()
+            self._cached_observation_images = (rgb, depth, seg)
         
         # 2. 提取目标掩膜
         target_mask = self.extract_target_mask(seg, spawned_objects)
@@ -100,7 +140,15 @@ class State:
             target_mask = np.zeros_like(depth, dtype=np.uint8)
         
         # 3. 提取全局掩膜
-        global_mask = self.extract_global_mask(seg, exclude_floor=True)
+        segmentation_for_objects = (
+            self._external_instance_map
+            if self._external_instance_map is not None
+            and self._external_instance_map.shape == seg.shape
+            else seg
+        )
+        global_mask = self.extract_global_mask(
+            segmentation_for_objects, exclude_floor=True
+        )
         if global_mask is None:
             print("⚠ 警告: 无法提取全局掩膜,使用全零掩膜")
             global_mask = np.zeros_like(depth, dtype=np.uint8)
@@ -395,6 +443,12 @@ class State:
         if seg_img is None:
             print("⚠ 警告: segmentation图像为空")
             return None
+
+        if (
+            self._external_target_mask is not None
+            and self._external_target_mask.shape == seg_img.shape
+        ):
+            return (self._external_target_mask > 0).astype(np.uint8) * 255
         
         # 获取所有唯一ID
         unique_ids = np.unique(seg_img)
@@ -467,7 +521,32 @@ class State:
                 if geom_prim is None and UsdGeom.Mesh(prim):
                     geom_prim = prim
             
-            # 方法2: 通过seg图像中的主要ID推断
+            # 优先从实例分割元数据按目标 prim 路径解析 ID。该分支只
+            # 是 Isaac Sim 的观测适配器；真实实验可直接使用上面的外部掩膜。
+            try:
+                info_all = self.camera.camera.data.info
+                info = info_all[0] if isinstance(info_all, list) else info_all
+                seg_info = (info or {}).get("instance_id_segmentation_fast", {})
+                labels = seg_info.get("idToLabels", {})
+                root = target_obj.cfg.prim_path.rstrip('/')
+                metadata_ids = []
+                for key, value in labels.items():
+                    if isinstance(value, str):
+                        texts = [value]
+                    elif isinstance(value, dict):
+                        texts = [str(item) for item in value.values()]
+                    elif isinstance(value, (list, tuple)):
+                        texts = [str(item) for item in value]
+                    else:
+                        texts = []
+                    if any(root in text for text in texts):
+                        metadata_ids.append(int(key))
+                if metadata_ids:
+                    return np.isin(seg_img, metadata_ids).astype(np.uint8) * 255
+            except Exception:
+                pass
+
+            # 兜底：通过seg图像中的主要ID推断
             # 获取目标物体中心位置对应的seg ID
             # 注意: 物体应该在调用此方法前已经更新过状态
             pos_3d = target_obj.data.root_pos_w[0]  # 世界坐标
